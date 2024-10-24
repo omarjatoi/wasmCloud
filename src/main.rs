@@ -347,7 +347,7 @@ struct Args {
     heartbeat_interval_seconds: Option<Duration>,
 
     /// If provided, overrides the default heartbeat interval of every 30 seconds. Provided value is interpreted as seconds.
-    #[arg(long = "heartbeat-interval", env = "WASMCLOUD_HEARTBEAT_INTERVAL", value_parser = parse_duration, hide = true)]
+    #[arg(long = "heartbeat-interval", env = "WASMCLOUD_HEARTBEAT_INTERVAL", value_parser = parse_duration_secs, hide = true)]
     heartbeat_interval: Option<Duration>,
 }
 
@@ -526,8 +526,9 @@ async fn main() -> anyhow::Result<()> {
         // once previous option (heartbeat_interval_seconds) is fully deprecated, uncomment below and remove `get_preffered_arg`
         // heartbeat_interval: args.heartbeat_interval,
         heartbeat_interval: Some(get_preferred_arg(
-            args.heartbeat_interval_seconds.unwrap(),
-            args.heartbeat_interval.unwrap(),
+            args.heartbeat_interval_seconds
+                .unwrap_or(Duration::from_secs(30)),
+            args.heartbeat_interval.unwrap_or(Duration::from_secs(30)),
             Duration::from_secs(30),
         )),
     }))
@@ -571,14 +572,14 @@ fn parse_duration_millis(arg: &str) -> anyhow::Result<Duration> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
-fn parse_duration(arg: &str) -> anyhow::Result<Duration, String> {
+fn parse_duration(arg: &str) -> anyhow::Result<Duration> {
     if let Ok(duration) = humantime::Duration::from_str(arg) {
         return Ok(duration.into());
     }
     if let Ok(millis) = arg.parse::<u64>() {
         return Ok(std::time::Duration::from_millis(millis));
     }
-    Err(format!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or milliseconds as an integer.", arg))
+    Err(anyhow::anyhow!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or milliseconds as an integer.", arg))
 }
 
 /// Temporary helper method to help with moving to using `humantime` compatible values for command line arguments
@@ -610,9 +611,13 @@ fn validate_nats_subject(subject: &str) -> anyhow::Result<()> {
 }
 
 fn parse_duration_secs(arg: &str) -> anyhow::Result<Duration> {
-    arg.parse()
-        .map(Duration::from_secs)
-        .map_err(|e| anyhow::anyhow!(e))
+    if let Ok(duration) = humantime::Duration::from_str(arg) {
+        return Ok(duration.into());
+    }
+    if let Ok(secs) = arg.parse::<u64>() {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    Err(anyhow::anyhow!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or seconds as an integer.", arg))
 }
 
 fn parse_label(labelpair: &str) -> anyhow::Result<(String, String)> {
