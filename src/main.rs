@@ -79,7 +79,7 @@ struct Args {
     #[clap(long = "provider-shutdown-delay-ms", default_value = "300", env = "WASMCLOUD_PROV_SHUTDOWN_DELAY_MS", value_parser = parse_duration_millis, hide = true, conflicts_with = "provider_shutdown_delay")]
     provider_shutdown_delay_ms: Duration,
     /// Delay between requesting a provider shut down and forcibly terminating its process
-    #[clap(long = "provider-shutdown-delay", alias = "provider-shutdown-delay", default_value = "300ms", env = "WASMCLOUD_PROV_SHUTDOWN_DELAY", value_parser = parse_duration)]
+    #[clap(long = "provider-shutdown-delay", alias = "provider-shutdown-delay", default_value = "300ms", env = "WASMCLOUD_PROV_SHUTDOWN_DELAY", value_parser = parse_duration_fallback_ms)]
     provider_shutdown_delay: Duration,
     /// Determines whether OCI images tagged latest are allowed to be pulled from OCI registries and started
     #[clap(long = "allow-latest", env = "WASMCLOUD_OCI_ALLOW_LATEST")]
@@ -188,7 +188,7 @@ struct Args {
     #[clap(long = "rpc-timeout-ms", default_value = "2000", env = "WASMCLOUD_RPC_TIMEOUT_MS", value_parser = parse_duration_millis, hide = true, conflicts_with = "rpc_timeout")]
     rpc_timeout_ms: Duration,
     /// Timeout for all RPC calls
-    #[clap(long = "rpc-timeout", default_value = "2000ms", env = "WASMCLOUD_RPC_TIMEOUT", value_parser = parse_duration, hide = true)]
+    #[clap(long = "rpc-timeout", default_value = "2000ms", env = "WASMCLOUD_RPC_TIMEOUT", value_parser = parse_duration_fallback_ms, hide = true)]
     rpc_timeout: Duration,
     /// Optional flag to require host communication over TLS with a NATS server for RPC messages
     #[clap(long = "rpc-tls", env = "WASMCLOUD_RPC_TLS", hide = true)]
@@ -208,7 +208,7 @@ struct Args {
     #[clap(long = "max-execution-time-ms", default_value = "600000", env = "WASMCLOUD_MAX_EXECUTION_TIME_MS", value_parser = parse_duration_millis, hide = true, conflicts_with = "max_execution_time")]
     max_execution_time_ms: Duration,
     /// If provided, allows to set a custom Max Execution time for the Host.
-    #[clap(long = "max-execution-time", default_value = "10m", env = "WASMCLOUD_MAX_EXECUTION_TIME", value_parser = parse_duration)]
+    #[clap(long = "max-execution-time", default_value = "10m", env = "WASMCLOUD_MAX_EXECUTION_TIME", value_parser = parse_duration_fallback_ms)]
     max_execution_time: Duration,
     /// The maximum amount of memory bytes that a component can allocate (default 256 MiB)
     #[clap(long = "max-linear-memory-bytes", default_value_t = 256 * 1024 * 1024, env = "WASMCLOUD_MAX_LINEAR_MEMORY")]
@@ -238,7 +238,7 @@ struct Args {
         long = "policy-timeout",
         env = "WASMCLOUD_POLICY_TIMEOUT",
         requires = "policy_topic",
-        value_parser = parse_duration,
+        value_parser = parse_duration_fallback_ms,
     )]
     policy_timeout: Option<Duration>,
 
@@ -347,7 +347,7 @@ struct Args {
     heartbeat_interval_seconds: Option<Duration>,
 
     /// If provided, overrides the default heartbeat interval of every 30 seconds. Provided value is interpreted as seconds.
-    #[arg(long = "heartbeat-interval", env = "WASMCLOUD_HEARTBEAT_INTERVAL", value_parser = parse_duration_secs, hide = true)]
+    #[arg(long = "heartbeat-interval", env = "WASMCLOUD_HEARTBEAT_INTERVAL", value_parser = parse_duration_fallback_secs, hide = true)]
     heartbeat_interval: Option<Duration>,
 }
 
@@ -572,14 +572,36 @@ fn parse_duration_millis(arg: &str) -> anyhow::Result<Duration> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
-fn parse_duration(arg: &str) -> anyhow::Result<Duration> {
+enum TimeUnit {
+    Ms,
+    Sec,
+}
+
+fn parse_duration(arg: &str, unit: TimeUnit) -> anyhow::Result<Duration> {
     if let Ok(duration) = humantime::Duration::from_str(arg) {
         return Ok(duration.into());
     }
-    if let Ok(millis) = arg.parse::<u64>() {
-        return Ok(std::time::Duration::from_millis(millis));
+    match unit {
+        TimeUnit::Sec => {
+            if let Ok(secs) = arg.parse::<u64>() {
+                return Ok(std::time::Duration::from_secs(secs));
+            }
+        }
+        TimeUnit::Ms => {
+            if let Ok(millis) = arg.parse::<u64>() {
+                return Ok(std::time::Duration::from_millis(millis));
+            }
+        }
     }
     Err(anyhow::anyhow!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or milliseconds as an integer.", arg))
+}
+
+fn parse_duration_fallback_secs(arg: &str) -> anyhow::Result<Duration> {
+    parse_duration(arg, TimeUnit::Sec)
+}
+
+fn parse_duration_fallback_ms(arg: &str) -> anyhow::Result<Duration> {
+    parse_duration(arg, TimeUnit::Ms)
 }
 
 /// Temporary helper method to help with moving to using `humantime` compatible values for command line arguments
@@ -611,13 +633,9 @@ fn validate_nats_subject(subject: &str) -> anyhow::Result<()> {
 }
 
 fn parse_duration_secs(arg: &str) -> anyhow::Result<Duration> {
-    if let Ok(duration) = humantime::Duration::from_str(arg) {
-        return Ok(duration.into());
-    }
-    if let Ok(secs) = arg.parse::<u64>() {
-        return Ok(std::time::Duration::from_secs(secs));
-    }
-    Err(anyhow::anyhow!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or seconds as an integer.", arg))
+    arg.parse()
+        .map(Duration::from_secs)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 fn parse_label(labelpair: &str) -> anyhow::Result<(String, String)> {
