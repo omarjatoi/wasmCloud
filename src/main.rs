@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use clap::{Arg, Parser};
+use clap::Parser;
 use nkeys::KeyPair;
 use regex::Regex;
 use tokio::time::{timeout, timeout_at};
@@ -572,6 +572,7 @@ fn parse_duration_millis(arg: &str) -> anyhow::Result<Duration> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+#[derive(Debug)]
 enum TimeUnit {
     Ms,
     Sec,
@@ -593,7 +594,9 @@ fn parse_duration(arg: &str, unit: TimeUnit) -> anyhow::Result<Duration> {
             }
         }
     }
-    Err(anyhow::anyhow!("Invalid duration: '{}'. Expected a duration like '5s', '1m', '100ms', or milliseconds as an integer.", arg))
+    Err(
+        anyhow::anyhow!("Invalid duration: '{}', unit: '{:?}'. Expected duration: '5s', '1m', '100ms', or an integer with unit: Ms, Sec", arg, unit),
+    )
 }
 
 fn parse_duration_fallback_secs(arg: &str) -> anyhow::Result<Duration> {
