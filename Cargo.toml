@@ -188,7 +188,7 @@ wrpc-transport-nats = { workspace = true }
 members = ["crates/*"]
 
 [workspace.dependencies]
-anstyle = { version = "1.0.8", default-features = false }
+anstyle = { version = "1.0.9", default-features = false }
 anyhow = { version = "1", default-features = false }
 assert-json-diff = { version = "2", default-features = false }
 async-compression = { version = "0.3", default-features = false }
@@ -249,8 +249,8 @@ normpath = { version = "1", default-features = false }
 notify = { version = "6", default-features = false }
 nuid = { version = "0.4", default-features = false }
 num = { version = "0.4", default-features = false }
-oci-client = { version = "0.13", default-features = false }
-oci-wasm = { version = "0.1.0", default-features = false }
+oci-client = { version = "0.14", default-features = false }
+oci-wasm = { version = "0.2.0", default-features = false }
 once_cell = { version = "1", default-features = false }
 opentelemetry = { version = "0.23", default-features = false }
 opentelemetry-appender-tracing = { version = "0.4", default-features = false }
@@ -343,7 +343,7 @@ wasm-encoder = { version = "0.219", default-features = false }
 wasm-gen = { version = "0.1", default-features = false }
 wasmcloud-component = { version = "0", path = "crates/component", default-features = false }
 wasmcloud-control-interface = { version = "2.2.0", path = "./crates/control-interface", default-features = false }
-wasmcloud-core = { version = "^0.13.0", path = "./crates/core", default-features = false }
+wasmcloud-core = { version = "^0.14.0", path = "./crates/core", default-features = false }
 wasmcloud-host = { version = "^0.22.0", path = "./crates/host", default-features = false }
 wasmcloud-provider-blobstore-azure = { version = "*", path = "./crates/provider-blobstore-azure", default-features = false }
 wasmcloud-provider-blobstore-fs = { version = "*", path = "./crates/provider-blobstore-fs", default-features = false }

@@ -61,7 +61,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Install `wash` CLI
-        uses: taiki-e/install-action@d2347103f7c028229cc9c9c440e90b572dd50592
+        uses: taiki-e/install-action@e35e2e777dde071a96489a02ac3f7d214dde10f1
         with:
           tool: wash-cli@${{ matrix.wash.version }}
 

@@ -139,9 +139,9 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.8"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bec1de6f59aedf83baf9ff929c98f2ad654b97c9510f4e70cf6f661d49fd5b1"
+checksum = "8365de52b16c035ff4fcafe0092ba9390540e3e352870ac09933bebcaa2c8c56"
 
 [[package]]
 name = "anstyle-parse"
@@ -1027,7 +1027,7 @@ dependencies = [
  "pin-project",
  "quick-xml",
  "rand 0.8.5",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "rustc_version",
  "serde 1.0.210",
  "serde_json",
@@ -1188,9 +1188,9 @@ dependencies = [
 
 [[package]]
 name = "bigdecimal"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d712318a27c7150326677b321a5fa91b55f6d9034ffd67f20319e147d40cee"
+checksum = "8f850665a0385e070b64c38d2354e6c104c8479c59868d1e48a0c13ee2c7a1c1"
 dependencies = [
  "autocfg",
  "libm",
@@ -1606,9 +1606,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.5.33"
+version = "4.5.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9646e2e245bf62f45d39a0f3f36f1171ad1ea0d6967fd114bca72cb02a8fcdfb"
+checksum = "86bc73de94bc81e52f3bebec71bc4463e9748f7a59166663e32044669577b0e2"
 dependencies = [
  "clap",
 ]
@@ -2434,7 +2434,7 @@ checksum = "9ac1e888d6830712d565b2f3a974be3200be9296bc1b03db8251a4cbf18a4a34"
 dependencies = [
  "futures",
  "rand 0.8.5",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "thiserror",
  "tokio",
 ]
@@ -3430,9 +3430,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41296eb09f183ac68eec06e03cdbea2e759633d4067b2f6552fc2e009bcad08b"
+checksum = "df2dcfbe0677734ab2f3ffa7fa7bfd4706bfdc1ef393f2ee30184aed67e631b4"
 dependencies = [
  "bytes",
  "futures-channel",
@@ -4383,9 +4383,9 @@ dependencies = [
 
 [[package]]
 name = "oci-client"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e050f8bab3f561aa5ab537e1a6ed24006d58b4ee93cd6bb2c0cb822726f306"
+checksum = "474675fdc023fbcc9dcf4782e938a3a1ae5fd469c728d8db40599bd25c77e1ba"
 dependencies = [
  "bytes",
  "chrono",
@@ -4397,7 +4397,7 @@ dependencies = [
  "oci-spec",
  "olpc-cjson",
  "regex",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "serde 1.0.210",
  "serde_json",
  "sha2",
@@ -4422,7 +4422,7 @@ dependencies = [
  "lazy_static 1.5.0",
  "olpc-cjson",
  "regex",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "serde 1.0.210",
  "serde_json",
  "sha2",
@@ -4450,9 +4450,9 @@ dependencies = [
 
 [[package]]
 name = "oci-wasm"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8403a1f0598a12452babb25a7bdf815269c4d83b064862a560879e66e3e85ee"
+checksum = "f147e207436277483c23cb8e55ccd039ee1657c6a8d19471a6de187da6973ef8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4929,9 +4929,9 @@ dependencies = [
 
 [[package]]
 name = "pin-project-lite"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
+checksum = "915a1e146535de9163f3987b8944ed8cf49a18bb0056bcebcdcece385cece4ff"
 
 [[package]]
 name = "pin-utils"
@@ -5182,7 +5182,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.12.1",
  "log",
  "multimap",
@@ -5650,9 +5650,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.8"
+version = "0.12.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f713147fbe92361e52392c73b8c9e48c04c6625bce969ef54dc901e58e042a7b"
+checksum = "a77c62af46e79de0a562e1a9849205ffcb7fc1238876e9bd743357570e04046f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -7877,7 +7877,7 @@ dependencies = [
  "once_cell",
  "pathdiff",
  "ptree",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "secrecy",
  "semver",
  "serde 1.0.210",
@@ -8072,7 +8072,7 @@ dependencies = [
  "provider-archive 0.12.1",
  "rand 0.8.5",
  "regex",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "rmp-serde",
  "rmpv",
  "sanitize-filename",
@@ -8105,7 +8105,7 @@ dependencies = [
  "wasm-pkg-client",
  "wasm-pkg-core",
  "wasmcloud-control-interface 2.2.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-provider-sdk",
  "wasmcloud-secrets-types 0.4.0",
  "wat",
@@ -8150,7 +8150,7 @@ dependencies = [
  "path-absolutize",
  "provider-archive 0.12.1",
  "regex",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "rmp-serde",
  "semver",
  "serde 1.0.210",
@@ -8183,7 +8183,7 @@ dependencies = [
  "wasm-pkg-client",
  "wasm-pkg-core",
  "wasmcloud-control-interface 2.2.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-test-util",
  "wasmparser 0.219.1",
  "wasmtime",
@@ -8390,9 +8390,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-pkg-client"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ff3e17576a2a2170f5ec4c2834c3a05504b3c38f1cdd669e48c4b570e47bfb4"
+checksum = "4a3d87dcebf18466cbbd926980e5460bb808a0112bb1dc5cc799fe470c3f8c16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8424,16 +8424,16 @@ dependencies = [
 
 [[package]]
 name = "wasm-pkg-common"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da50c3adeef70b9ffbef0000eedff727ea050148a42cfc8a27f25f1e3bb100ae"
+checksum = "8ca6fb1d9c267809e4e9db5cfea0907dd818bf88b682b3ef609fa104b68c305f"
 dependencies = [
  "anyhow",
  "bytes",
  "etcetera",
  "futures-util",
  "http 1.1.0",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "semver",
  "serde 1.0.210",
  "serde_json",
@@ -8446,9 +8446,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-pkg-core"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e725c69e07fe449134fa6d2c0d6659ea6be4104bf024534ae802ac15cc86dd5"
+checksum = "c2f2f779377701d6b94b50ce25ab8b8f5400c6cbf9dc3a78ce2dfa6407b1b48f"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -8516,7 +8516,7 @@ dependencies = [
  "rand 0.8.5",
  "redis",
  "regex",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "rmp-serde",
  "rustversion",
  "secrets-nats-kv",
@@ -8534,7 +8534,7 @@ dependencies = [
  "vaultrs",
  "wascap 0.15.1",
  "wasmcloud-control-interface 2.2.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-host",
  "wasmcloud-provider-blobstore-azure",
  "wasmcloud-provider-blobstore-fs",
@@ -8561,7 +8561,9 @@ dependencies = [
 name = "wasmcloud-component"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "futures",
+ "http 1.1.0",
  "rand 0.8.5",
  "tokio",
  "uuid 1.11.0",
@@ -8587,7 +8589,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-opentelemetry",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
 ]
 
 [[package]]
@@ -8644,7 +8646,7 @@ dependencies = [
 
 [[package]]
 name = "wasmcloud-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -8659,7 +8661,7 @@ dependencies = [
  "oci-wasm",
  "once_cell",
  "provider-archive 0.12.1",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "rustls 0.23.13",
  "rustls-native-certs 0.8.0",
  "rustls-pemfile 2.2.0",
@@ -8712,7 +8714,7 @@ dependencies = [
  "uuid 1.11.0",
  "wascap 0.15.1",
  "wasmcloud-control-interface 2.2.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-runtime",
  "wasmcloud-secrets-client",
  "wasmcloud-secrets-types 0.4.0",
@@ -8829,7 +8831,7 @@ dependencies = [
 
 [[package]]
 name = "wasmcloud-provider-http-server"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -8841,7 +8843,7 @@ dependencies = [
  "http 1.1.0",
  "http-body 1.0.1",
  "pin-project-lite",
- "reqwest 0.12.8",
+ "reqwest 0.12.9",
  "serde 1.0.210",
  "serde_json",
  "thiserror",
@@ -8983,7 +8985,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "uuid 1.11.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-tracing",
  "wrpc-interface-http",
  "wrpc-transport",
@@ -8995,7 +8997,7 @@ name = "wasmcloud-provider-sqldb-postgres"
 version = "0.7.2"
 dependencies = [
  "anyhow",
- "bigdecimal 0.4.5",
+ "bigdecimal 0.4.6",
  "bit-vec",
  "bytes",
  "chrono",
@@ -9045,7 +9047,7 @@ dependencies = [
  "wascap 0.15.1",
  "wasi-preview1-component-adapter-provider",
  "wasmcloud-component",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmparser 0.219.1",
  "wasmtime",
  "wasmtime-wasi",
@@ -9108,6 +9110,7 @@ dependencies = [
  "async-nats",
  "cloudevents-sdk",
  "nkeys",
+ "reqwest 0.12.9",
  "rmp-serde",
  "serde 1.0.210",
  "serde_json",
@@ -9119,7 +9122,7 @@ dependencies = [
  "url",
  "wascap 0.15.1",
  "wasmcloud-control-interface 2.2.0",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
  "wasmcloud-host",
  "wasmcloud-secrets-types 0.4.0",
 ]
@@ -9143,7 +9146,7 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "wasmcloud-core 0.13.0",
+ "wasmcloud-core 0.14.0",
 ]
 
 [[package]]
@@ -9628,7 +9631,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
