@@ -17,7 +17,7 @@ use wash_lib::config::DEFAULT_LATTICE;
 use wasmcloud_core::parse_wit_meta_from_operation;
 use wit_bindgen_wrpc::wrpc_transport::InvokeExt as _;
 
-use crate::util::{default_timeout_ms, extract_arg_value, msgpack_to_json_val};
+use crate::util::{default_timeout, default_timeout_ms, extract_arg_value, msgpack_to_json_val};
 
 const DEFAULT_HTTP_SCHEME: &str = "http";
 const DEFAULT_HTTP_HOST: &str = "localhost";
@@ -248,6 +248,15 @@ pub struct ConnectionOpts {
     )]
     timeout_ms: u64,
 
+    /// Timeout length for RPC, defaults to 2000 milliseconds
+    #[clap(
+        // short = 't',
+        long = "rpc-timeout",
+        default_value_t = default_timeout(),
+        env = "WASMCLOUD_RPC_TIMEOUT"
+    )]
+    timeout: Duration,
+
     /// Name of the context to use for RPC connection, authentication, and cluster seed invocation signing
     #[clap(long = "context")]
     pub context: Option<String>,
@@ -374,6 +383,7 @@ async fn wrpc_invoke_http_handler(
     lattice: &str,
     component_id: &str,
     timeout_ms: u64,
+    timeout: Duration,
     request: http::request::Request<String>,
     extract_json: bool,
 ) -> Result<CommandOutput> {

@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -32,6 +33,10 @@ pub fn extract_arg_value(arg: &str) -> Result<String> {
 
 pub fn default_timeout_ms() -> u64 {
     DEFAULT_NATS_TIMEOUT_MS
+}
+
+pub fn default_timeout() -> Duration {
+    parse_duration_fallback_ms(default_timeout_ms())
 }
 
 /// Transform a json string (e.g. "{"hello": "world"}") into msgpack bytes

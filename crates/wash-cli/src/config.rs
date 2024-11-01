@@ -98,6 +98,10 @@ pub async fn configure_host_env(wasmcloud_opts: WasmcloudOpts) -> Result<HashMap
     }
     host_config.insert(
         WASMCLOUD_MAX_EXECUTION_TIME_MS.to_string(),
+        wasmcloud_opts.max_execution_time_ms.to_string(),
+    );
+    host_config.insert(
+        WASMCLOUD_MAX_EXECUTION_TIME_MS.to_string(),
         wasmcloud_opts.max_execution_time.to_string(),
     );
     if let Some(policy_topic) = wasmcloud_opts.policy_topic {
@@ -132,6 +136,12 @@ pub async fn configure_host_env(wasmcloud_opts: WasmcloudOpts) -> Result<HashMap
         host_config.insert(
             WASMCLOUD_RPC_TIMEOUT_MS.to_string(),
             rpc_timeout_ms.to_string(),
+        );
+    }
+    if let Some(rpc_timeout) = wasmcloud_opts.rpc_timeout {
+        host_config.insert(
+            WASMCLOUD_RPC_TIMEOUT_MS.to_string(),
+            rpc_timeout.to_string(),
         );
     }
     if let Some(path) = wasmcloud_opts.rpc_credsfile {
@@ -175,6 +185,10 @@ pub async fn configure_host_env(wasmcloud_opts: WasmcloudOpts) -> Result<HashMap
         host_config.insert(WASMCLOUD_CTL_TLS.to_string(), "true".to_string());
     }
 
+    host_config.insert(
+        WASMCLOUD_PROV_SHUTDOWN_DELAY_MS.to_string(),
+        wasmcloud_opts.provider_delay_ms.to_string(),
+    );
     host_config.insert(
         WASMCLOUD_PROV_SHUTDOWN_DELAY_MS.to_string(),
         wasmcloud_opts.provider_delay.to_string(),

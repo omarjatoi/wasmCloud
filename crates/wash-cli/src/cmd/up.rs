@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::Client;
+use chrono::Duration;
 use clap::Parser;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -38,18 +39,19 @@ use crate::app::deploy_model_from_manifest;
 use crate::appearance::spinner::Spinner;
 use crate::config::{
     configure_host_env, DEFAULT_ALLOW_FILE_LOAD, DEFAULT_LATTICE, DEFAULT_MAX_EXECUTION_TIME_MS,
-    DEFAULT_NATS_HOST, DEFAULT_NATS_PORT, DEFAULT_NATS_WEBSOCKET_PORT,
-    DEFAULT_PROV_SHUTDOWN_DELAY_MS, DEFAULT_RPC_TIMEOUT_MS, DEFAULT_STRUCTURED_LOG_LEVEL,
-    NATS_SERVER_VERSION, WADM_VERSION, WASMCLOUD_ALLOW_FILE_LOAD, WASMCLOUD_CLUSTER_ISSUERS,
-    WASMCLOUD_CLUSTER_SEED, WASMCLOUD_CONFIG_SERVICE, WASMCLOUD_CTL_CREDSFILE, WASMCLOUD_CTL_HOST,
-    WASMCLOUD_CTL_JWT, WASMCLOUD_CTL_PORT, WASMCLOUD_CTL_SEED, WASMCLOUD_CTL_TLS,
-    WASMCLOUD_CTL_TLS_CA_FILE, WASMCLOUD_ENABLE_IPV6, WASMCLOUD_HOST_LOG_PATH, WASMCLOUD_HOST_PATH,
-    WASMCLOUD_HOST_SEED, WASMCLOUD_HOST_VERSION, WASMCLOUD_JS_DOMAIN, WASMCLOUD_LATTICE,
-    WASMCLOUD_LOG_LEVEL, WASMCLOUD_MAX_EXECUTION_TIME_MS, WASMCLOUD_OCI_ALLOWED_INSECURE,
-    WASMCLOUD_OCI_ALLOW_LATEST, WASMCLOUD_POLICY_TOPIC, WASMCLOUD_PROV_SHUTDOWN_DELAY_MS,
+    DEFAULT_NATS_HOST, DEFAULT_NATS_PORT, DEFAULT_NATS_WEBSOCKET_PORT, DEFAULT_PROV_SHUTDOWN_DELAY,
+    DEFAULT_PROV_SHUTDOWN_DELAY_MS, DEFAULT_RPC_TIMEOUT, DEFAULT_RPC_TIMEOUT_MS,
+    DEFAULT_STRUCTURED_LOG_LEVEL, NATS_SERVER_VERSION, WADM_VERSION, WASMCLOUD_ALLOW_FILE_LOAD,
+    WASMCLOUD_CLUSTER_ISSUERS, WASMCLOUD_CLUSTER_SEED, WASMCLOUD_CONFIG_SERVICE,
+    WASMCLOUD_CTL_CREDSFILE, WASMCLOUD_CTL_HOST, WASMCLOUD_CTL_JWT, WASMCLOUD_CTL_PORT,
+    WASMCLOUD_CTL_SEED, WASMCLOUD_CTL_TLS, WASMCLOUD_CTL_TLS_CA_FILE, WASMCLOUD_ENABLE_IPV6,
+    WASMCLOUD_HOST_LOG_PATH, WASMCLOUD_HOST_PATH, WASMCLOUD_HOST_SEED, WASMCLOUD_HOST_VERSION,
+    WASMCLOUD_JS_DOMAIN, WASMCLOUD_LATTICE, WASMCLOUD_LOG_LEVEL, WASMCLOUD_MAX_EXECUTION_TIME,
+    WASMCLOUD_MAX_EXECUTION_TIME_MS, WASMCLOUD_OCI_ALLOWED_INSECURE, WASMCLOUD_OCI_ALLOW_LATEST,
+    WASMCLOUD_POLICY_TOPIC, WASMCLOUD_PROV_SHUTDOWN_DELAY, WASMCLOUD_PROV_SHUTDOWN_DELAY_MS,
     WASMCLOUD_RPC_CREDSFILE, WASMCLOUD_RPC_HOST, WASMCLOUD_RPC_JWT, WASMCLOUD_RPC_PORT,
-    WASMCLOUD_RPC_SEED, WASMCLOUD_RPC_TIMEOUT_MS, WASMCLOUD_RPC_TLS, WASMCLOUD_RPC_TLS_CA_FILE,
-    WASMCLOUD_SECRETS_TOPIC, WASMCLOUD_STRUCTURED_LOGGING_ENABLED,
+    WASMCLOUD_RPC_SEED, WASMCLOUD_RPC_TIMEOUT, WASMCLOUD_RPC_TIMEOUT_MS, WASMCLOUD_RPC_TLS,
+    WASMCLOUD_RPC_TLS_CA_FILE, WASMCLOUD_SECRETS_TOPIC, WASMCLOUD_STRUCTURED_LOGGING_ENABLED,
 };
 
 use crate::down::stop_nats;
@@ -183,6 +185,10 @@ pub struct WasmcloudOpts {
     #[clap(long = "rpc-timeout-ms", default_value = DEFAULT_RPC_TIMEOUT_MS, env = WASMCLOUD_RPC_TIMEOUT_MS)]
     pub rpc_timeout_ms: Option<u64>,
 
+    /// Timeout duration for all RPC calls
+    #[clap(long = "rpc-timeout", default_value = DEFAULT_RPC_TIMEOUT, env = WASMCLOUD_RPC_TIMEOUT)]
+    pub rpc_timeout: Option<Duration>,
+
     /// A user JWT to use to authenticate to NATS for RPC messages
     #[clap(long = "rpc-jwt", env = WASMCLOUD_RPC_JWT, requires = "rpc_seed")]
     pub rpc_jwt: Option<String>,
@@ -236,8 +242,12 @@ pub struct WasmcloudOpts {
     pub cluster_issuers: Option<Vec<String>>,
 
     /// Delay, in milliseconds, between requesting a provider shut down and forcibly terminating its process
-    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY_MS)]
-    pub provider_delay: u32,
+    #[clap(long = "provider-delay-ms", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY_MS)]
+    pub provider_delay_ms: u32,
+
+    /// Delay duration between requesting a provider shut down and forcibly terminating its process
+    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY, env = WASMCLOUD_PROV_SHUTDOWN_DELAY)]
+    pub provider_delay: Duration,
 
     /// Determines whether OCI images tagged latest are allowed to be pulled from OCI registries and started
     #[clap(long = "allow-latest", env = WASMCLOUD_OCI_ALLOW_LATEST)]
@@ -288,7 +298,11 @@ pub struct WasmcloudOpts {
 
     /// Defines the Max Execution time (in ms) that the host runtime will execute for
     #[clap(long = "max-execution-time-ms", alias = "max-time-ms", env = WASMCLOUD_MAX_EXECUTION_TIME_MS, default_value = DEFAULT_MAX_EXECUTION_TIME_MS)]
-    pub max_execution_time: u64,
+    pub max_execution_time_ms: u64,
+
+    /// Defines the Max Execution time (in ms) that the host runtime will execute for
+    #[clap(long = "max-execution-time", alias = "max-time", env = WASMCLOUD_MAX_EXECUTION_TIME, default_value = DEFAULT_MAX_EXECUTION_TIME)]
+    pub max_execution_time: Duration,
 
     /// If provided, enables interfacing with a secrets backend for secret retrieval over the given topic prefix.
     #[clap(long = "secrets-topic", env = WASMCLOUD_SECRETS_TOPIC)]
