@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::Client;
-use chrono::Duration;
 use clap::Parser;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 use sysinfo::{System, SystemExt};
 use tokio::fs::create_dir_all;
 use tokio::{
@@ -55,6 +55,7 @@ use crate::config::{
 };
 
 use crate::down::stop_nats;
+use crate::util::parse_duration_fallback_ms;
 
 #[derive(Parser, Debug, Clone)]
 pub struct UpCommand {
@@ -182,11 +183,11 @@ pub struct WasmcloudOpts {
     pub rpc_seed: Option<String>,
 
     /// Timeout in milliseconds for all RPC calls
-    #[clap(long = "rpc-timeout-ms", default_value = DEFAULT_RPC_TIMEOUT_MS, env = WASMCLOUD_RPC_TIMEOUT_MS)]
+    #[clap(long = "rpc-timeout-ms", default_value = DEFAULT_RPC_TIMEOUT_MS, env = WASMCLOUD_RPC_TIMEOUT_MS, hide = true, conflicts_with = "rpc_timeout")]
     pub rpc_timeout_ms: Option<u64>,
 
     /// Timeout duration for all RPC calls
-    #[clap(long = "rpc-timeout", default_value = DEFAULT_RPC_TIMEOUT, env = WASMCLOUD_RPC_TIMEOUT)]
+    #[clap(long = "rpc-timeout", default_value = DEFAULT_RPC_TIMEOUT_MS, env = WASMCLOUD_RPC_TIMEOUT, value_parser = parse_duration_fallback_ms)]
     pub rpc_timeout: Option<Duration>,
 
     /// A user JWT to use to authenticate to NATS for RPC messages
@@ -242,11 +243,11 @@ pub struct WasmcloudOpts {
     pub cluster_issuers: Option<Vec<String>>,
 
     /// Delay, in milliseconds, between requesting a provider shut down and forcibly terminating its process
-    #[clap(long = "provider-delay-ms", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY_MS)]
+    #[clap(long = "provider-delay-ms", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY_MS, hide = true, conflicts_with = "provider_delay")]
     pub provider_delay_ms: u32,
 
     /// Delay duration between requesting a provider shut down and forcibly terminating its process
-    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY, env = WASMCLOUD_PROV_SHUTDOWN_DELAY)]
+    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY, value_parser = parse_duration_fallback_ms)]
     pub provider_delay: Duration,
 
     /// Determines whether OCI images tagged latest are allowed to be pulled from OCI registries and started
@@ -297,11 +298,11 @@ pub struct WasmcloudOpts {
     pub multi_local: bool,
 
     /// Defines the Max Execution time (in ms) that the host runtime will execute for
-    #[clap(long = "max-execution-time-ms", alias = "max-time-ms", env = WASMCLOUD_MAX_EXECUTION_TIME_MS, default_value = DEFAULT_MAX_EXECUTION_TIME_MS)]
+    #[clap(long = "max-execution-time-ms", alias = "max-time-ms", env = WASMCLOUD_MAX_EXECUTION_TIME_MS, default_value = DEFAULT_MAX_EXECUTION_TIME_MS, hide = true, conflicts_with = "max_execution_time")]
     pub max_execution_time_ms: u64,
 
     /// Defines the Max Execution time (in ms) that the host runtime will execute for
-    #[clap(long = "max-execution-time", alias = "max-time", env = WASMCLOUD_MAX_EXECUTION_TIME, default_value = DEFAULT_MAX_EXECUTION_TIME)]
+    #[clap(long = "max-execution-time", alias = "max-time", env = WASMCLOUD_MAX_EXECUTION_TIME, default_value = DEFAULT_MAX_EXECUTION_TIME_MS, value_parser = parse_duration_fallback_ms)]
     pub max_execution_time: Duration,
 
     /// If provided, enables interfacing with a secrets backend for secret retrieval over the given topic prefix.
@@ -1072,6 +1073,7 @@ mod tests {
     use super::UpCommand;
     use anyhow::Result;
     use clap::Parser;
+    use humantime::Duration;
 
     const LOCAL_REGISTRY: &str = "localhost:5001";
 
@@ -1217,7 +1219,10 @@ mod tests {
             up_all_flags.nats_opts.nats_remote_url,
             Some("tls://remote.global".to_string())
         );
-        assert_eq!(up_all_flags.wasmcloud_opts.provider_delay, 500);
+        assert_eq!(
+            up_all_flags.wasmcloud_opts.provider_delay,
+            Duration::from_millis(500)
+        );
         assert!(up_all_flags.detached);
 
         Ok(())

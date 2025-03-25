@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
@@ -36,9 +37,22 @@ pub fn default_timeout_ms() -> u64 {
 }
 
 pub fn default_timeout() -> Duration {
-    parse_duration_fallback_ms(default_timeout_ms())
+    Duration::from_millis(default_timeout_ms())
 }
 
+pub fn parse_duration_fallback_ms(dur: &str) -> anyhow::Result<Duration> {
+    if let Ok(duration) = humantime::Duration::from_str(dur) {
+        return Ok(duration.into());
+    }
+    if let Ok(millis) = dur.parse::<u64>() {
+        return Ok(std::time::Duration::from_millis(millis));
+    }
+
+    Err(anyhow::anyhow!(
+        "Invalid duration: '{}'. Expected duration: '5s', '1m', '100ms'",
+        dur
+    ))
+}
 /// Transform a json string (e.g. "{"hello": "world"}") into msgpack bytes
 pub fn json_str_to_msgpack_bytes(payload: &str) -> Result<Vec<u8>> {
     let json: serde_json::Value =
