@@ -38,25 +38,25 @@ spec:
     - name: sqldb-postgres
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/sqldb-postgres:0.7.1
+        image: ghcr.io/wasmcloud/sqldb-postgres:0.9.0
 
     # A capability provider that provides HTTP serving for the component
     - name: http-server
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/http-server:0.23.1
+        image: ghcr.io/wasmcloud/http-server:0.27.0
 
     # A component that uses both capability providers above (HTTP server and sqldb-postgres)
     # to provide a TODO app on http://localhost:8080
     - name: todo-app
       type: component
       properties:
-        image: ghcr.io/wasmcloud/component-todoapp-postgres-rust:0.1.0
+        image: file://build/todo_app_s.wasm
       traits:
         # Govern the spread/scheduling of the component
         - type: spreadscaler
           properties:
-            replicas: 1
+            instances: 1
 
         # Link the httpserver to the component, and configure the HTTP server
         # to listen on port 8080 for incoming requests
@@ -78,7 +78,7 @@ spec:
             namespace: wasmcloud
             package: sqldb-postgres
             interfaces: [query, prepared]
-            # NOTE: When configuraiton is specified below only by name, it references a named configuration
+            # NOTE: When configuration is specified below only by name, it references a named configuration
             # (ex. one set via `wash config put`)
             target_config:
               - name: pg
@@ -95,12 +95,14 @@ WADM files should not be checked into source control containing secrets.
 
 New named configuration can be specified by using `wash config put`.
 
-| Property                | Example     | Description                                               |
-| ----------------------- | ----------- | --------------------------------------------------------- |
-| `POSTGRES_HOST`         | `localhost` | Postgres cluster hostname                                 |
-| `POSTGRES_PORT`         | `5432`      | Postgres cluster port                                     |
-| `POSTGRES_USERNAME`     | `postgres`  | Postgres cluster username                                 |
-| `POSTGRES_TLS_REQUIRED` | `false`     | Whether TLS should be required for al managed connections |
+| Property                | Example     | Description                                                                                                                                                         |
+| ----------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POSTGRES_HOST`         | `localhost` | Postgres cluster hostname                                                                                                                                           |
+| `POSTGRES_PORT`         | `5432`      | Postgres cluster port                                                                                                                                               |
+| `POSTGRES_USERNAME`     | `postgres`  | Postgres cluster username                                                                                                                                           |
+| `POSTGRES_DATABASE`     | `postgres`  | Postgres cluster database                                                                                                                                           |
+| `POSTGRES_TLS_REQUIRED` | `false`     | Whether TLS should be required for all managed connections                                                                                                          |
+| `POSTGRES_POOL_SIZE`    | `12`        | Maximum size of the connection pool (configures [max_size](https://docs.rs/deadpool-postgres/0.14.1/deadpool_postgres/struct.PoolConfig.html#structfield.max_size)) |
 
 Once named configuration with the keys above is created, it can be referenced as `target_config` for a link to this provider.
 
@@ -114,7 +116,7 @@ For example, the following WADM manifest fragment:
   traits:
     - type: spreadscaler
       properties:
-        replicas: 1
+        instances: 1
     - type: link
       properties:
         target: sqldb-postgres
@@ -134,13 +136,13 @@ The `querier` component in the snippet above specifies a link to a `sqldb-postgr
 
 ## 🔐 Secret Settings
 
-While most values can be specified via named configuration, sensitive values like the `POSTGRES_PASSWORD` should be speicified via *secrets*.
+While most values can be specified via named configuration, sensitive values like the `POSTGRES_PASSWORD` should be specified via _secrets_.
 
 New secrets be specified by using `wash secrets put`.
 
-| Property                | Example     | Description                                               |
-| ----------------------- | ----------- | --------------------------------------------------------- |
-| `POSTGRES_PASSWORD`     | `postgres`  | Postgres cluster password                                 |
+| Property            | Example    | Description               |
+| ------------------- | ---------- | ------------------------- |
+| `POSTGRES_PASSWORD` | `postgres` | Postgres cluster password |
 
 Once a secret has been created, it can be referenced in the link to the provider.
 
@@ -154,7 +156,7 @@ For example, the following WADM manifest fragment:
   traits:
     - type: spreadscaler
       properties:
-        replicas: 1
+        instances: 1
     - type: link
       properties:
         target: sqldb-postgres

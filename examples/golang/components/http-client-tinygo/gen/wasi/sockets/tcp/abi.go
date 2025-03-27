@@ -3,24 +3,26 @@
 package tcp
 
 import (
-	"github.com/bytecodealliance/wasm-tools-go/cm"
-	"github.com/wasmcloud/wasmcloud/examples/golang/components/http-client-tinygo/gen/wasi/io/streams"
 	"github.com/wasmcloud/wasmcloud/examples/golang/components/http-client-tinygo/gen/wasi/sockets/network"
+	"go.bytecodealliance.org/cm"
 	"unsafe"
 )
 
 // TupleTCPSocketInputStreamOutputStreamShape is used for storage in variant or result types.
 type TupleTCPSocketInputStreamOutputStreamShape struct {
-	shape [unsafe.Sizeof(cm.Tuple3[TCPSocket, streams.InputStream, streams.OutputStream]{})]byte
+	_     cm.HostLayout
+	shape [unsafe.Sizeof(cm.Tuple3[TCPSocket, InputStream, OutputStream]{})]byte
 }
 
 // TupleInputStreamOutputStreamShape is used for storage in variant or result types.
 type TupleInputStreamOutputStreamShape struct {
-	shape [unsafe.Sizeof(cm.Tuple[streams.InputStream, streams.OutputStream]{})]byte
+	_     cm.HostLayout
+	shape [unsafe.Sizeof(cm.Tuple[InputStream, OutputStream]{})]byte
 }
 
 // IPSocketAddressShape is used for storage in variant or result types.
 type IPSocketAddressShape struct {
+	_     cm.HostLayout
 	shape [unsafe.Sizeof(network.IPSocketAddress{})]byte
 }
 
@@ -62,14 +64,14 @@ func lower_IPSocketAddress(v network.IPSocketAddress) (f0 uint32, f1 uint32, f2 
 	f0 = (uint32)(v.Tag())
 	switch f0 {
 	case 0: // ipv4
-		v1, v2, v3, v4, v5 := lower_IPv4SocketAddress(*v.IPv4())
+		v1, v2, v3, v4, v5 := lower_IPv4SocketAddress(*cm.Case[network.IPv4SocketAddress](&v, 0))
 		f1 = (uint32)(v1)
 		f2 = (uint32)(v2)
 		f3 = (uint32)(v3)
 		f4 = (uint32)(v4)
 		f5 = (uint32)(v5)
 	case 1: // ipv6
-		v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11 := lower_IPv6SocketAddress(*v.IPv6())
+		v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11 := lower_IPv6SocketAddress(*cm.Case[network.IPv6SocketAddress](&v, 1))
 		f1 = (uint32)(v1)
 		f2 = (uint32)(v2)
 		f3 = (uint32)(v3)

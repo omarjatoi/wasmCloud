@@ -1,10 +1,9 @@
 [![Stars](https://img.shields.io/github/stars/wasmcloud?color=gold&label=wasmCloud%20Org%20Stars)](https://github.com/wasmcloud/)
 [![Homepage and Documentation](https://img.shields.io/website?label=Documentation&url=https%3A%2F%2Fwasmcloud.com)](https://wasmcloud.com)
-[![CNCF sandbox project](https://img.shields.io/website?label=CNCF%20Sandbox%20Project&url=https://landscape.cncf.io/?selected=wasm-cloud&item=orchestration-management--scheduling-orchestration--wasmcloud)](https://landscape.cncf.io/?selected=wasm-cloud&item=orchestration-management--scheduling-orchestration--wasmcloud)
+[![CNCF Incubating project](https://img.shields.io/website?label=CNCF%20Incubating%20Project&url=https://landscape.cncf.io/?selected=wasm-cloud&item=orchestration-management--scheduling-orchestration--wasmcloud)](https://landscape.cncf.io/?selected=wasm-cloud&item=orchestration-management--scheduling-orchestration--wasmcloud)
 ![Powered by WebAssembly](https://img.shields.io/badge/powered%20by-WebAssembly-orange.svg)
-[![OpenSSF Best Practices](https://bestpractices.coreinfrastructure.org/projects/6363/badge)](https://bestpractices.coreinfrastructure.org/projects/6363)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/wasmcloud/wasmcloud/badge)](https://securityscorecards.dev/viewer/?uri=github.com/wasmcloud/wasmcloud)
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/wasmcloud-chart)](https://artifacthub.io/packages/search?repo=wasmcloud-chart)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/6363/badge)](https://www.bestpractices.dev/projects/6363)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/wasmCloud/wasmCloud/badge)](https://securityscorecards.dev/viewer/?uri=github.com/wasmCloud/wasmCloud)
 [![CLOMonitor](https://img.shields.io/endpoint?url=https://clomonitor.io/api/projects/cncf/wasm-cloud/badge)](https://clomonitor.io/projects/cncf/wasm-cloud)
 [![FOSSA Status](https://app.fossa.com/api/projects/custom%2B40030%2Fgit%40github.com%3AwasmCloud%2FwasmCloud.git.svg?type=small)](https://app.fossa.com/projects/custom%2B40030%2Fgit%40github.com%3AwasmCloud%2FwasmCloud.git?ref=badge_small)
 [![twitter](https://img.shields.io/twitter/follow/wasmcloud?style=social)](https://twitter.com/wasmcloud)
@@ -71,7 +70,7 @@ Want to get involved? For more information on how to contribute and our contribu
 
 ### Community Meetings
 
-We host weekly community meetings at 1pm EST on Wednesdays. These community meetings are livestreamed to our Twitter account and to [YouTube](https://www.youtube.com/@wasmCloud/streams). You can find the agenda and notes for each meeting in the [community](https://wasmcloud.com/community) secton of our webste. If you're interested in joining in on the call to demo or take part in the discussion, we have a Zoom link on our [community calendar](https://calendar.google.com/calendar/u/0/embed?src=c_6cm5hud8evuns4pe5ggu3h9qrs@group.calendar.google.com).
+We host weekly community meetings at 1pm EST on Wednesdays. These community meetings are livestreamed to our Twitter account and to [YouTube](https://www.youtube.com/@wasmCloud/streams). You can find the agenda and notes for each meeting in the [community](https://wasmcloud.com/community) section of our website. If you're interested in joining in on the call to demo or take part in the discussion, we have a Zoom link on our [community calendar](https://calendar.google.com/calendar/u/0/embed?src=c_6cm5hud8evuns4pe5ggu3h9qrs@group.calendar.google.com).
 
 ### Slack
 
@@ -99,7 +98,7 @@ The **w**asmCloud **A**pplication **D**eployment **M**anager [wadm](https://gith
 
 ## Language Support & SDKs
 
-wasmCloud is compatible with any language that supports the [WebAssembly Component Model](https://component-model.bytecodealliance.org/language-support.html). We provide first-party examples in [Rust](./examples/rust/), [Go](./examples/golang/), [Python](./examples/python), and [TypeScript](./examples/typescript/). If your language isn't listed yet, let us know with the [language support form](https://share.hsforms.com/1cedPVcwwQd6dQePZ3BWccQccyup).
+wasmCloud is compatible with any language that supports the [WebAssembly Component Model](https://component-model.bytecodealliance.org/language-support.html). We provide first-party examples in [Rust](./examples/rust/), [Go](./examples/golang/), [Python](./examples/python), and [TypeScript](https://github.com/wasmCloud/typescript/tree/main/examples). If your language isn't listed yet, let us know with the [language support form](https://share.hsforms.com/1cedPVcwwQd6dQePZ3BWccQccyup).
 
 ### Capability Provider SDK
 
@@ -110,4 +109,4 @@ wasmCloud provides the following SDKs for creating capability providers; native 
 
 ---
 
-_We are a Cloud Native Computing Foundation [sandbox project](https://www.cncf.io/sandbox-projects/)._
+_We are a Cloud Native Computing Foundation [Incubating project](https://www.cncf.io/projects/)._

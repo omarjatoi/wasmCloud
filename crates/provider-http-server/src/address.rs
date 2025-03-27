@@ -15,20 +15,19 @@ use axum::handler::Handler;
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument};
-use wasmcloud_provider_sdk::core::{ComponentId, LinkName};
-use wasmcloud_provider_sdk::{HostData, LinkConfig, LinkDeleteInfo, Provider};
+use wasmcloud_core::http::{default_listen_address, load_settings, ServiceSettings};
+use wasmcloud_provider_sdk::core::LinkName;
+use wasmcloud_provider_sdk::provider::WrpcClient;
+use wasmcloud_provider_sdk::{get_connection, HostData, LinkConfig, LinkDeleteInfo, Provider};
 
-use crate::settings::default_listen_address;
-use crate::{
-    build_request, get_cors_layer, get_tcp_listener, invoke_component, load_settings,
-    ServiceSettings,
-};
+use crate::{build_request, get_cors_layer, get_tcp_listener, invoke_component};
 
 /// Lookup for handlers by socket
 ///
 /// Indexed first by socket address to more easily detect duplicates,
 /// with the http server stored, along with a list (order matters) of components that were registered
-type HandlerLookup = HashMap<SocketAddr, (Arc<HttpServerCore>, Vec<(ComponentId, LinkName)>)>;
+type HandlerLookup =
+    HashMap<SocketAddr, (Arc<HttpServerCore>, Vec<(Arc<str>, Arc<str>, WrpcClient)>)>;
 
 /// `wrpc:http/incoming-handler` provider implementation in address mode
 #[derive(Clone)]
@@ -48,8 +47,8 @@ impl Default for HttpServerProvider {
     fn default() -> Self {
         Self {
             default_address: default_listen_address(),
-            handlers_by_socket: Default::default(),
-            sockets_by_link_name: Default::default(),
+            handlers_by_socket: Arc::default(),
+            sockets_by_link_name: Arc::default(),
         }
     }
 }
@@ -67,8 +66,8 @@ impl HttpServerProvider {
 
         Ok(Self {
             default_address,
-            handlers_by_socket: Default::default(),
-            sockets_by_link_name: Default::default(),
+            handlers_by_socket: Arc::default(),
+            sockets_by_link_name: Arc::default(),
         })
     }
 }
@@ -94,9 +93,14 @@ impl Provider for HttpServerProvider {
             }
         };
 
+        let wrpc = get_connection()
+            .get_wrpc_client(link_config.target_id)
+            .await
+            .context("failed to construct wRPC client")?;
         let component_meta = (
-            link_config.target_id.to_string(),
-            link_config.link_name.to_string(),
+            Arc::from(link_config.target_id),
+            Arc::from(link_config.link_name),
+            wrpc,
         );
         let mut sockets_by_link_name = self.sockets_by_link_name.write().await;
         let mut handlers_by_socket = self.handlers_by_socket.write().await;
@@ -121,7 +125,7 @@ impl Provider for HttpServerProvider {
             //
             // NOTE: only components at the head of the list are served requests
             std::collections::hash_map::Entry::Occupied(mut v) => {
-                v.get_mut().1.push(component_meta)
+                v.get_mut().1.push(component_meta);
             }
             // If a handler does not already exist, make a new server and insert
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -145,15 +149,17 @@ impl Provider for HttpServerProvider {
     async fn delete_link_as_source(&self, info: impl LinkDeleteInfo) -> anyhow::Result<()> {
         let component_id = info.get_target_id();
         let link_name = info.get_link_name();
-        let existing_meta = (component_id.into(), link_name.into());
 
         // Retrieve the thing by link name
-        let sockets_by_link_name = self.sockets_by_link_name.read().await;
+        let mut sockets_by_link_name = self.sockets_by_link_name.write().await;
         if let Some(addr) = sockets_by_link_name.get(link_name) {
             let mut handlers_by_socket = self.handlers_by_socket.write().await;
             if let Some((server, component_metas)) = handlers_by_socket.get_mut(addr) {
                 // If the component id & link name pair is present, remove it
-                if let Some(idx) = component_metas.iter().position(|v| v == &existing_meta) {
+                if let Some(idx) = component_metas
+                    .iter()
+                    .position(|(c, l, ..)| c.as_ref() == component_id && l.as_ref() == link_name)
+                {
                     component_metas.remove(idx);
                 }
 
@@ -165,6 +171,7 @@ impl Provider for HttpServerProvider {
                     );
                     server.handle.shutdown();
                     handlers_by_socket.remove(addr);
+                    sockets_by_link_name.remove(link_name);
                 }
             }
         }
@@ -181,7 +188,7 @@ impl Provider for HttpServerProvider {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RequestContext {
     /// Address of the server, used for handler lookup
     server_address: SocketAddr,
@@ -194,7 +201,7 @@ struct RequestContext {
 }
 
 /// Handle an HTTP request by invoking the target component as configured in the listener
-#[instrument(level = "debug", skip(settings))]
+#[instrument(level = "debug", skip(settings, handlers_by_socket))]
 async fn handle_request(
     extract::State(RequestContext {
         server_address,
@@ -202,29 +209,36 @@ async fn handle_request(
         scheme,
         handlers_by_socket,
     }): extract::State<RequestContext>,
-    extract::Host(authority): extract::Host,
+    axum_extra::extract::Host(authority): axum_extra::extract::Host,
     request: extract::Request,
 ) -> impl axum::response::IntoResponse {
-    let component_id = {
-        let Some(component_id) = handlers_by_socket
+    let (component_id, wrpc) = {
+        let Some((component_id, wrpc)) = handlers_by_socket
             .read()
             .await
             .get(&server_address)
             .and_then(|v| v.1.first())
-            .map(|(component_id, _)| component_id.to_string())
+            .map(|(component_id, _, wrpc)| (Arc::clone(component_id), wrpc.clone()))
         else {
             return Err((
                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                "no targets for HTTP request".into(),
-            ));
+                "no targets for HTTP request",
+            ))?;
         };
-        component_id
+        (component_id, wrpc)
     };
 
     let timeout = settings.timeout_ms.map(Duration::from_millis);
-    let req = build_request(request, scheme, authority, settings.clone())?;
-    Ok::<_, (http::StatusCode, String)>(
-        invoke_component(component_id, req, timeout, settings.cache_control.as_ref()).await,
+    let req = build_request(request, scheme, authority, &settings)?;
+    axum::response::Result::<_, axum::response::ErrorResponse>::Ok(
+        invoke_component(
+            &wrpc,
+            &component_id,
+            req,
+            timeout,
+            settings.cache_control.as_ref(),
+        )
+        .await,
     )
 }
 
@@ -238,7 +252,7 @@ pub struct HttpServerCore {
 }
 
 impl HttpServerCore {
-    #[instrument]
+    #[instrument(skip(handlers_by_socket))]
     pub async fn new(
         settings: Arc<ServiceSettings>,
         target: &str,
@@ -250,10 +264,10 @@ impl HttpServerCore {
             component_id = target,
             "httpserver starting listener for target",
         );
-        let cors = get_cors_layer(settings.clone())?;
+        let cors = get_cors_layer(&settings)?;
         let service = handle_request.layer(cors);
         let handle = axum_server::Handle::new();
-        let listener = get_tcp_listener(settings.clone())
+        let listener = get_tcp_listener(&settings)
             .with_context(|| format!("failed to create listener (is [{addr}] already in use?)"))?;
 
         let target = target.to_owned();
@@ -266,13 +280,14 @@ impl HttpServerCore {
                 .await
                 .context("failed to construct TLS config")?;
 
+            let srv = axum_server::from_tcp_rustls(listener, tls);
             tokio::spawn(async move {
-                if let Err(e) = axum_server::from_tcp_rustls(listener, tls)
+                if let Err(e) = srv
                     .handle(task_handle)
                     .serve(
                         service
                             .with_state(RequestContext {
-                                server_address: settings.address,
+                                server_address: addr,
                                 settings,
                                 scheme: http::uri::Scheme::HTTPS,
                                 handlers_by_socket,
@@ -287,13 +302,15 @@ impl HttpServerCore {
         } else {
             debug!(?addr, "bind HTTP listener");
 
+            let mut srv = axum_server::from_tcp(listener);
+            srv.http_builder().http1().keep_alive(false);
             tokio::spawn(async move {
-                if let Err(e) = axum_server::from_tcp(listener)
+                if let Err(e) = srv
                     .handle(task_handle)
                     .serve(
                         service
                             .with_state(RequestContext {
-                                server_address: settings.address,
+                                server_address: addr,
                                 settings,
                                 scheme: http::uri::Scheme::HTTP,
                                 handlers_by_socket,

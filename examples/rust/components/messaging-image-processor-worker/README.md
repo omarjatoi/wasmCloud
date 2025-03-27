@@ -28,7 +28,7 @@ If deploying with the [wasmCloud Application Deployment Manager (`wadm`)][wadm],
 
 By default, the `blobstore-fs` and `messaging-nats` providers are used as they require no extra dependencies (ex. docker containers) to run infrastructure.
 
-This component (the image processor) and the HTTP task manager component communicate via [wRPC][wrpc] (and the [NATS messaging system powering wasmCloud][nats]), so there's no need ot hit the external API, WebAssembly function calls are automatically transformed into low-latency distributed RPC invocations to the HTTP task manager.
+This component (the image processor) and the HTTP task manager component communicate via [wRPC][wrpc] (and the [NATS messaging system powering wasmCloud][nats]), so there's no need to hit the external API, WebAssembly function calls are automatically transformed into low-latency distributed RPC invocations to the HTTP task manager.
 
 [nats]: https://wasmcloud.com/docs/deployment/nats/cluster-config
 [wasmcloud-wrpc]: https://wasmcloud.com/docs/reference/glossary#wrpc
@@ -53,7 +53,7 @@ wash build
 Note that if you'd like to build with `cargo` you need to specify the `--target` option:
 
 ```console
-cargo build --target=wasm32-wasi
+cargo build --target=wasm32-wasip1
 ```
 
 [wash]: https://wasmcloud.com/docs/cli
@@ -96,7 +96,7 @@ See [the docs for the HTTP task manager][component-http-task-manager] for more i
 First, make sure the HTTP task manager is migrated:
 
 ```console
-curl -X POST localhost:8080/admin/v1/db/migrate
+curl -X POST localhost:8000/admin/v1/db/migrate
 ```
 
 Then, create a new job:
@@ -104,7 +104,7 @@ Then, create a new job:
 ```console
 curl \
     -X POST \
-    "localhost:8080/api/v1/tasks/submit \
+    "localhost:8000/api/v1/tasks/submit \
     --data-binary @- <<EOF
 {
   "source": {

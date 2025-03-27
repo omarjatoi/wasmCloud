@@ -3,26 +3,27 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{anyhow, bail, ensure, Context as _};
 use async_nats::subject::ToSubject;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use opentelemetry_nats::{attach_span_context, NatsHeaderInjector};
 use tokio::fs;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, instrument, warn};
 use tracing_futures::Instrument;
 use wascap::prelude::KeyPair;
+use wasmcloud_core::messaging::ConnectionConfig;
 use wasmcloud_provider_sdk::core::HostData;
+use wasmcloud_provider_sdk::provider::WrpcClient;
 use wasmcloud_provider_sdk::wasmcloud_tracing::context::TraceContextInjector;
 use wasmcloud_provider_sdk::{
-    get_connection, load_host_data, propagate_trace_for_ctx, run_provider, serve_provider_exports,
-    Context, LinkConfig, LinkDeleteInfo, Provider,
+    get_connection, initialize_observability, load_host_data, propagate_trace_for_ctx,
+    run_provider, serve_provider_exports, Context, LinkConfig, LinkDeleteInfo, Provider,
 };
 
 mod connection;
-use connection::ConnectionConfig;
 
 mod bindings {
     wit_bindgen_wrpc::generate!({
@@ -42,7 +43,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// [`NatsClientBundle`]s hold a NATS client and information (subscriptions)
 /// related to it.
 ///
-/// This struct is necssary because subscriptions are *not* automatically removed on client drop,
+/// This struct is necessary because subscriptions are *not* automatically removed on client drop,
 /// meaning that we must keep track of all subscriptions to close once the client is done
 #[derive(Debug)]
 struct NatsClientBundle {
@@ -68,20 +69,23 @@ pub struct NatsMessagingProvider {
 
 impl NatsMessagingProvider {
     pub async fn run() -> anyhow::Result<()> {
+        initialize_observability!(
+            "nats-messaging-provider",
+            std::env::var_os("PROVIDER_NATS_MESSAGING_FLAMEGRAPH_PATH")
+        );
+
         let host_data = load_host_data().context("failed to load host data")?;
         let provider = Self::from_host_data(host_data);
         let shutdown = run_provider(provider.clone(), "messaging-nats-provider")
             .await
             .context("failed to run provider")?;
         let connection = get_connection();
-        serve_provider_exports(
-            &connection.get_wrpc_client(connection.provider_key()),
-            provider,
-            shutdown,
-            bindings::serve,
-        )
-        .await
-        .context("failed to serve provider exports")
+        let wrpc = connection
+            .get_wrpc_client(connection.provider_key())
+            .await?;
+        serve_provider_exports(&wrpc, provider, shutdown, bindings::serve)
+            .await
+            .context("failed to serve provider exports")
     }
 
     /// Build a [`NatsMessagingProvider`] from [`HostData`]
@@ -104,11 +108,15 @@ impl NatsMessagingProvider {
         cfg: ConnectionConfig,
         component_id: &str,
     ) -> anyhow::Result<NatsClientBundle> {
+        ensure!(
+            cfg.consumers.is_empty(),
+            "JetStream consumers not supported by this provider"
+        );
         let mut opts = match (cfg.auth_jwt, cfg.auth_seed) {
             (Some(jwt), Some(seed)) => {
                 let seed = KeyPair::from_seed(&seed).context("failed to parse seed key pair")?;
                 let seed = Arc::new(seed);
-                async_nats::ConnectOptions::with_jwt(jwt, move |nonce| {
+                async_nats::ConnectOptions::with_jwt(jwt.into_string(), move |nonce| {
                     let seed = seed.clone();
                     async move { seed.sign(&nonce).map_err(async_nats::AuthError::new) }
                 })
@@ -116,9 +124,9 @@ impl NatsMessagingProvider {
             (None, None) => async_nats::ConnectOptions::default(),
             _ => bail!("must provide both jwt and seed for jwt authentication"),
         };
-        if let Some(tls_ca) = &cfg.tls_ca {
+        if let Some(tls_ca) = cfg.tls_ca.as_deref() {
             opts = add_tls_ca(tls_ca, opts)?;
-        } else if let Some(tls_ca_file) = &cfg.tls_ca_file {
+        } else if let Some(tls_ca_file) = cfg.tls_ca_file.as_deref() {
             let ca = fs::read_to_string(tls_ca_file)
                 .await
                 .context("failed to read TLS CA file")?;
@@ -135,19 +143,19 @@ impl NatsMessagingProvider {
 
         let client = opts
             .name("NATS Messaging Provider") // allow this to show up uniquely in a NATS connection list
-            .connect(url)
+            .connect(url.as_ref())
             .await?;
 
         // Connections
         let mut sub_handles = Vec::new();
         for sub in cfg.subscriptions.iter().filter(|s| !s.is_empty()) {
             let (sub, queue) = match sub.split_once('|') {
-                Some((sub, queue)) => (sub, Some(queue.to_string())),
+                Some((sub, queue)) => (sub, Some(queue.into())),
                 None => (sub.as_str(), None),
             };
 
             sub_handles.push((
-                sub.to_string(),
+                sub.into(),
                 self.subscribe(&client, component_id, sub.to_string(), queue)
                     .await?,
             ));
@@ -174,41 +182,30 @@ impl NatsMessagingProvider {
 
         debug!(?component_id, "spawning listener for component");
 
-        let component_id = Arc::new(component_id.to_string());
+        let component_id = Arc::from(component_id);
         // Spawn a thread that listens for messages coming from NATS
         // this thread is expected to run the full duration that the provider is available
         let join_handle = tokio::spawn(async move {
-            // MAGIC NUMBER: Based on our benchmark testing, this seems to be a good upper limit
-            // where we start to get diminishing returns. We can consider making this
-            // configurable down the line.
-            // NOTE (thomastaylor312): It may be better to have a semaphore pool on the
-            // NatsMessagingProvider struct that has a global limit of permits so that we don't end
-            // up with 20 subscriptions all getting slammed with up to 75 tasks, but we should wait
-            // to do anything until we see what happens with real world usage and benchmarking
-            let semaphore = Arc::new(Semaphore::new(75));
-
+            let wrpc = match get_connection()
+                .get_wrpc_client_custom(&component_id, None)
+                .await
+            {
+                Ok(wrpc) => Arc::new(wrpc),
+                Err(err) => {
+                    error!(?err, "failed to construct wRPC client");
+                    return;
+                }
+            };
             // Listen for NATS message(s)
             while let Some(msg) = subscriber.next().await {
-                debug!(?msg, ?component_id, "received messsage");
+                debug!(?msg, ?component_id, "received message");
                 // Set up tracing context for the NATS message
                 let span = tracing::debug_span!("handle_message", ?component_id);
 
-                let permit = match semaphore
-                    .clone()
-                    .acquire_owned()
-                    .instrument(tracing::trace_span!("acquire_semaphore"))
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(_) => {
-                        warn!("Work pool has been closed, exiting queue subscribe");
-                        break;
-                    }
-                };
-
                 let component_id = Arc::clone(&component_id);
+                let wrpc = Arc::clone(&wrpc);
                 tokio::spawn(async move {
-                    dispatch_msg(component_id.as_str(), msg, permit)
+                    dispatch_msg(&wrpc, &component_id, msg)
                         .instrument(span)
                         .await;
                 });
@@ -220,11 +217,7 @@ impl NatsMessagingProvider {
 }
 
 #[instrument(level = "debug", skip_all, fields(component_id = %component_id, subject = %nats_msg.subject, reply_to = ?nats_msg.reply))]
-async fn dispatch_msg(
-    component_id: &str,
-    nats_msg: async_nats::Message,
-    _permit: OwnedSemaphorePermit,
-) {
+async fn dispatch_msg(wrpc: &WrpcClient, component_id: &str, nats_msg: async_nats::Message) {
     match nats_msg.headers {
         // If there are some headers on the message they might contain a span context
         // so attempt to attach them.
@@ -237,8 +230,8 @@ async fn dispatch_msg(
 
     let msg = BrokerMessage {
         body: nats_msg.payload,
-        reply_to: nats_msg.reply.map(|s| s.to_string()),
-        subject: nats_msg.subject.to_string(),
+        reply_to: nats_msg.reply.map(|s| s.into_string()),
+        subject: nats_msg.subject.into_string(),
     };
     debug!(
         subject = msg.subject,
@@ -250,12 +243,8 @@ async fn dispatch_msg(
     for (k, v) in TraceContextInjector::default_with_span().iter() {
         cx.insert(k.as_str(), v.as_str())
     }
-    if let Err(e) = bindings::wasmcloud::messaging::handler::handle_message(
-        &get_connection().get_wrpc_client_custom(component_id, None),
-        Some(cx),
-        &msg,
-    )
-    .await
+    if let Err(e) =
+        bindings::wasmcloud::messaging::handler::handle_message(wrpc, Some(cx), &msg).await
     {
         error!(
             error = %e,
@@ -280,9 +269,9 @@ impl Provider for NatsMessagingProvider {
             self.default_config.clone()
         } else {
             // create a config from the supplied values and merge that with the existing default
-            match ConnectionConfig::from_link_config(&link_config) {
+            match connection::from_link_config(&link_config) {
                 Ok(cc) => self.default_config.merge(&ConnectionConfig {
-                    subscriptions: Vec::new(),
+                    subscriptions: Box::default(),
                     ..cc
                 }),
                 Err(e) => {
@@ -308,15 +297,14 @@ impl Provider for NatsMessagingProvider {
     #[instrument(level = "debug", skip_all, fields(target_id))]
     async fn receive_link_config_as_source(
         &self,
-        LinkConfig {
-            target_id, config, ..
-        }: LinkConfig<'_>,
+        link_config: LinkConfig<'_>,
     ) -> anyhow::Result<()> {
-        let config = if config.is_empty() {
+        let target_id = link_config.target_id;
+        let config = if link_config.config.is_empty() {
             self.default_config.clone()
         } else {
             // create a config from the supplied values and merge that with the existing default
-            match ConnectionConfig::from_map(config) {
+            match connection::from_link_config(&link_config) {
                 Ok(cc) => self.default_config.merge(&cc),
                 Err(e) => {
                     error!("Failed to build connection configuration: {e:?}");
@@ -347,7 +335,7 @@ impl Provider for NatsMessagingProvider {
             let client = &bundle.client;
             debug!(
                 component_id,
-                "droping NATS client [{}] for (consumer) component",
+                "dropping NATS client [{}] for (consumer) component",
                 format!(
                     "{}:{}",
                     client.server_info().server_id,
@@ -364,7 +352,7 @@ impl Provider for NatsMessagingProvider {
         Ok(())
     }
 
-    #[instrument(level = "info", skip_all, fields(target_id = info.get_source_id()))]
+    #[instrument(level = "info", skip_all, fields(target_id = info.get_target_id()))]
     async fn delete_link_as_source(&self, info: impl LinkDeleteInfo) -> anyhow::Result<()> {
         // If we were the source, then the component we're invoking is the target
         let component_id = info.get_target_id();
@@ -374,7 +362,7 @@ impl Provider for NatsMessagingProvider {
             let client = &bundle.client;
             debug!(
                 component_id,
-                "droping NATS client [{}] and associated subscriptions [{}] for (handler) component",
+                "dropping NATS client [{}] and associated subscriptions [{}] for (handler) component",
                 format!(
                     "{}:{}",
                     client.server_info().server_id,
@@ -442,21 +430,16 @@ impl bindings::exports::wasmcloud::messaging::consumer::Handler<Option<Context>>
         let res = match msg.reply_to.clone() {
             Some(reply_to) => if should_strip_headers(&msg.subject) {
                 nats_client
-                    .publish_with_reply(msg.subject.to_string(), reply_to, body)
+                    .publish_with_reply(msg.subject, reply_to, body)
                     .await
             } else {
                 nats_client
-                    .publish_with_reply_and_headers(
-                        msg.subject.to_string(),
-                        reply_to,
-                        headers,
-                        body,
-                    )
+                    .publish_with_reply_and_headers(msg.subject, reply_to, headers, body)
                     .await
             }
             .map_err(|e| e.to_string()),
             None => nats_client
-                .publish_with_headers(msg.subject.to_string(), headers, body)
+                .publish_with_headers(msg.subject, headers, body)
                 .await
                 .map_err(|e| e.to_string()),
         };
@@ -515,8 +498,8 @@ impl bindings::exports::wasmcloud::messaging::consumer::Handler<Option<Context>>
             }
             Ok(Ok(resp)) => Ok(Ok(BrokerMessage {
                 body: resp.payload,
-                reply_to: resp.reply.map(|s| s.to_string()),
-                subject: resp.subject.to_string(),
+                reply_to: resp.reply.map(|s| s.into_string()),
+                subject: resp.subject.into_string(),
             })),
         }
     }
@@ -528,7 +511,7 @@ fn should_strip_headers(topic: &str) -> bool {
     topic.starts_with("$SYS")
 }
 
-fn add_tls_ca(
+pub fn add_tls_ca(
     tls_ca: &str,
     opts: async_nats::ConnectOptions,
 ) -> anyhow::Result<async_nats::ConnectOptions> {
@@ -562,9 +545,9 @@ mod test {
 "#;
 
         let config: ConnectionConfig = serde_json::from_str(input).unwrap();
-        assert_eq!(config.auth_jwt.unwrap(), "authy");
-        assert_eq!(config.auth_seed.unwrap(), "seedy");
-        assert_eq!(config.cluster_uris, ["nats://soyvuh"]);
+        assert_eq!(config.auth_jwt.unwrap().as_ref(), "authy");
+        assert_eq!(config.auth_seed.unwrap().as_ref(), "seedy");
+        assert_eq!(config.cluster_uris, [Box::from("nats://soyvuh")].into());
         assert_eq!(config.custom_inbox_prefix, None);
         assert!(config.subscriptions.is_empty());
         assert!(config.ping_interval_sec.is_none());
@@ -574,30 +557,30 @@ mod test {
     fn test_connectionconfig_merge() {
         // second > original, individual vec fields are replace not extend
         let cc1 = ConnectionConfig {
-            cluster_uris: vec!["old_server".to_string()],
-            subscriptions: vec!["topic1".to_string()],
+            cluster_uris: ["old_server".into()].into(),
+            subscriptions: ["topic1".into()].into(),
             custom_inbox_prefix: Some("_NOPE.>".into()),
             ..Default::default()
         };
         let cc2 = ConnectionConfig {
-            cluster_uris: vec!["server1".to_string(), "server2".to_string()],
-            auth_jwt: Some("jawty".to_string()),
+            cluster_uris: ["server1".into(), "server2".into()].into(),
+            auth_jwt: Some("jawty".into()),
             ..Default::default()
         };
         let cc3 = cc1.merge(&cc2);
         assert_eq!(cc3.cluster_uris, cc2.cluster_uris);
         assert_eq!(cc3.subscriptions, cc1.subscriptions);
-        assert_eq!(cc3.auth_jwt, Some("jawty".to_string()));
-        assert_eq!(cc3.custom_inbox_prefix, Some("_NOPE.>".to_string()));
+        assert_eq!(cc3.auth_jwt, Some("jawty".into()));
+        assert_eq!(cc3.custom_inbox_prefix, Some("_NOPE.>".into()));
     }
 
     #[test]
     fn test_from_map() -> anyhow::Result<()> {
         let cc = ConnectionConfig::from_map(&HashMap::from([(
-            "custom_inbox_prefix".to_string(),
-            "_TEST.>".to_string(),
+            "custom_inbox_prefix".into(),
+            "_TEST.>".into(),
         )]))?;
-        assert_eq!(cc.custom_inbox_prefix, Some("_TEST.>".to_string()));
+        assert_eq!(cc.custom_inbox_prefix, Some("_TEST.>".into()));
         Ok(())
     }
 }

@@ -3,10 +3,12 @@
 package store
 
 import (
+	"go.bytecodealliance.org/cm"
 	"unsafe"
 )
 
 // SecretsErrorShape is used for storage in variant or result types.
 type SecretsErrorShape struct {
+	_     cm.HostLayout
 	shape [unsafe.Sizeof(SecretsError{})]byte
 }

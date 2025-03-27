@@ -1,6 +1,6 @@
 [package]
 name = "wasmcloud-provider-messaging-kafka"
-version = "0.5.1"
+version = "0.6.0"
 description = """
 A capability provider that satisfies the 'wasmcloud:messaging' contract using Kafka as a backend.
 """
@@ -17,7 +17,6 @@ status = "actively-developed"
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock"] }
 futures = { workspace = true }
 kafka = { workspace = true }
 tokio = { workspace = true }

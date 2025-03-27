@@ -9,28 +9,17 @@ updates:
       patterns:
       - "wasmtime*"
 - package-ecosystem: "cargo"
-  directory: "/tests/actors/rust"
+  directory: "/tests/components/rust"
   schedule:
     interval: "daily"
-- package-ecosystem: npm
-  directory: "/typescript"
-  open-pull-requests-limit: 20
+- package-ecosystem: "cargo"
+  directory: "/examples/rust/components/http-hello-world"
   schedule:
-    interval: "weekly"
-    day: "monday"
-    time: "09:00"
-    timezone: "America/New_York"
-  groups:
-    dev-dependencies:
-      dependency-type: "development"
-      update-types:
-        - "minor"
-        - "patch"
-    prod-dependencies:
-      dependency-type: "production"
-      update-types:
-        - "minor"
-        - "patch"
+    interval: "daily"
+- package-ecosystem: "cargo"
+  directory: "/examples/rust/components/http-keyvalue-counter"
+  schedule:
+    interval: "daily"
 - package-ecosystem: "github-actions"
   directory: "/"
   schedule:
@@ -46,5 +35,10 @@ updates:
     interval: "daily"
 - package-ecosystem: "github-actions"
   directory: "/.github/actions/install-nix"
+  schedule:
+    interval: "daily"
+- package-ecosystem: "docker"
+  directories:
+    - "**/*Dockerfile*"
   schedule:
     interval: "daily"

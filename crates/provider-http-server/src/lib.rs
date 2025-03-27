@@ -16,7 +16,7 @@
 //!   - bind path/address
 //!   - TLS
 //!   - Cors
-//! - Flexible confiuration loading: from host, or from local toml or json file.
+//! - Flexible configuration loading: from host, or from local toml or json file.
 //! - Fully asynchronous, using tokio lightweight "green" threads
 //! - Thread pool (for managing a pool of OS threads). The default
 //!   thread pool has one thread per cpu core.
@@ -29,7 +29,6 @@ use core::task::{ready, Context, Poll};
 use core::time::Duration;
 
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _};
 use axum::extract;
@@ -39,16 +38,15 @@ use pin_project_lite::pin_project;
 use tokio::task::JoinHandle;
 use tokio::{spawn, time};
 use tower_http::cors::{self, CorsLayer};
-use tracing::{debug, trace};
-use wasmcloud_provider_sdk::{
-    get_connection, initialize_observability, load_host_data, run_provider,
-};
+use tracing::{debug, info, trace};
+use wasmcloud_core::http::{load_settings, ServiceSettings};
+use wasmcloud_provider_sdk::provider::WrpcClient;
+use wasmcloud_provider_sdk::{initialize_observability, load_host_data, run_provider};
 use wrpc_interface_http::InvokeIncomingHandler as _;
 
 mod address;
+mod host;
 mod path;
-mod settings;
-pub use settings::{load_settings, ServiceSettings};
 
 pub async fn run() -> anyhow::Result<()> {
     initialize_observability!(
@@ -57,7 +55,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let host_data = load_host_data().context("failed to load host data")?;
-    match host_data.config.get("routing_mode").map(|s| s.as_str()) {
+    match host_data.config.get("routing_mode").map(String::as_str) {
         // Run provider in address mode by default
         Some("address") | None => run_provider(
             address::HttpServerProvider::new(host_data).context(
@@ -78,6 +76,16 @@ pub async fn run() -> anyhow::Result<()> {
             .await?
             .await;
         }
+        Some("host") => {
+            run_provider(
+                host::HttpServerProvider::new(host_data).await.context(
+                    "failed to create host-mode HTTP server provider from hostdata configuration",
+                )?,
+                "http-server-provider",
+            )
+            .await?
+            .await;
+        }
         Some(other) => bail!("unknown routing_mode: {other}"),
     };
 
@@ -89,8 +97,8 @@ pub(crate) fn build_request(
     request: extract::Request,
     scheme: http::uri::Scheme,
     authority: String,
-    settings: Arc<ServiceSettings>,
-) -> Result<http::Request<axum::body::Body>, (http::StatusCode, String)> {
+    settings: &ServiceSettings,
+) -> Result<http::Request<axum::body::Body>, axum::response::ErrorResponse> {
     let method = request.method();
     if let Some(readonly_mode) = settings.readonly_mode {
         if readonly_mode
@@ -100,7 +108,7 @@ pub(crate) fn build_request(
             debug!("only GET and HEAD allowed in read-only mode");
             Err((
                 http::StatusCode::METHOD_NOT_ALLOWED,
-                "only GET and HEAD allowed in read-only mode".to_string(),
+                "only GET and HEAD allowed in read-only mode",
             ))?;
         }
     }
@@ -128,7 +136,7 @@ pub(crate) fn build_request(
     let mut req = http::Request::builder();
     *req.headers_mut().ok_or((
         http::StatusCode::INTERNAL_SERVER_ERROR,
-        "invalid request generated".to_string(),
+        "invalid request generated",
     ))? = headers;
     let req = req
         .uri(uri)
@@ -141,7 +149,8 @@ pub(crate) fn build_request(
 
 /// Invoke a component with the given request
 pub(crate) async fn invoke_component(
-    target: impl AsRef<str>,
+    wrpc: &WrpcClient,
+    target: &str,
     req: http::Request<axum::body::Body>,
     timeout: Option<Duration>,
     cache_control: Option<&String>,
@@ -149,19 +158,15 @@ pub(crate) async fn invoke_component(
     // Create a new wRPC client with all headers from the current span injected
     let mut cx = async_nats::HeaderMap::new();
     for (k, v) in
-        wasmcloud_provider_sdk::wasmcloud_tracing::context::TraceContextInjector::default_with_span(
+        wasmcloud_provider_sdk::wasmcloud_tracing::context::TraceContextInjector::new_with_extractor(
+            &wasmcloud_provider_sdk::wasmcloud_tracing::http::HeaderExtractor(req.headers()),
         )
         .iter()
     {
-        cx.insert(k.as_str(), v.as_str())
+        cx.insert(k.as_str(), v.as_str());
     }
 
-    let wrpc = get_connection().get_wrpc_client_custom(target.as_ref(), None);
-    trace!(
-        ?req,
-        component_id = target.as_ref(),
-        "httpserver calling component"
-    );
+    trace!(?req, component_id = target, "httpserver calling component");
     let fut = wrpc.invoke_handle_http(Some(cx), req);
     let res = if let Some(timeout) = timeout {
         let Ok(res) = time::timeout(timeout, fut).await else {
@@ -191,7 +196,7 @@ pub(crate) async fn invoke_component(
 }
 
 /// Helper function to construct a [`CorsLayer`] according to the [`ServiceSettings`].
-pub(crate) fn get_cors_layer(settings: Arc<ServiceSettings>) -> anyhow::Result<CorsLayer> {
+pub(crate) fn get_cors_layer(settings: &ServiceSettings) -> anyhow::Result<CorsLayer> {
     let allow_origin = settings.cors_allowed_origins.as_ref();
     let allow_origin: Vec<_> = allow_origin
         .map(|origins| {
@@ -276,7 +281,7 @@ pub(crate) fn get_cors_layer(settings: Arc<ServiceSettings>) -> anyhow::Result<C
 ///
 /// Note that this function actually calls the `bind` method on the [`TcpSocket`], it's up to the
 /// caller to ensure that the address is not already in use (or to handle the error if it is).
-pub(crate) fn get_tcp_listener(settings: Arc<ServiceSettings>) -> anyhow::Result<TcpListener> {
+pub(crate) fn get_tcp_listener(settings: &ServiceSettings) -> anyhow::Result<TcpListener> {
     let socket = match &settings.address {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
         SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
@@ -289,6 +294,22 @@ pub(crate) fn get_tcp_listener(settings: Arc<ServiceSettings>) -> anyhow::Result
     socket
         .set_reuseaddr(!cfg!(windows))
         .context("Error when setting socket to reuseaddr")?;
+    socket
+        .set_nodelay(true)
+        .context("failed to set `TCP_NODELAY`")?;
+
+    match settings.disable_keepalive {
+        Some(false) => {
+            info!("disabling TCP keepalive");
+            socket
+                .set_keepalive(false)
+                .context("failed to disable TCP keepalive")?
+        }
+        None | Some(true) => socket
+            .set_keepalive(true)
+            .context("failed to enable TCP keepalive")?,
+    }
+
     socket
         .bind(settings.address)
         .context("Unable to bind to address")?;
@@ -337,7 +358,7 @@ impl http_body::Body for ResponseBody {
         match this.errors.poll_next(cx) {
             Poll::Ready(Some(err)) => {
                 if let Some(io) = this.io.as_pin_mut() {
-                    io.abort()
+                    io.abort();
                 }
                 return Poll::Ready(Some(Err(anyhow!(err).context("failed to process body"))));
             }
@@ -347,13 +368,13 @@ impl http_body::Body for ResponseBody {
             Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
             Some(Err(err)) => {
                 if let Some(io) = this.io.as_pin_mut() {
-                    io.abort()
+                    io.abort();
                 }
                 Poll::Ready(Some(Err(err)))
             }
             None => {
                 if let Some(io) = this.io.as_pin_mut() {
-                    io.abort()
+                    io.abort();
                 }
                 Poll::Ready(None)
             }

@@ -1,6 +1,6 @@
 [package]
 name = "wasmcloud-runtime"
-version = "0.6.0"
+version = "0.10.0"
 description = "wasmCloud runtime library"
 readme = "README.md"
 
@@ -22,16 +22,13 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true, features = ["async-await", "std"] }
 http = { workspace = true }
-http-body = { workspace = true }
-http-body-util = { workspace = true }
-nkeys = { workspace = true }
-rand = { workspace = true, features = ["std"] }
 secrecy = { workspace = true }
+semver = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync"] }
 tokio-stream = { workspace = true }
-tokio-util = { workspace = true, features = ["codec", "io"] }
 tracing = { workspace = true }
-uuid = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 wascap = { workspace = true }
 wasi-preview1-component-adapter-provider = { workspace = true }
 wasmcloud-core = { workspace = true }
@@ -51,7 +48,6 @@ wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 wit-bindgen-wrpc = { workspace = true }
 wit-component = { workspace = true }
-wit-parser = { workspace = true }
 wrpc-interface-blobstore = { workspace = true }
 wrpc-interface-http = { workspace = true, features = ["wasmtime-wasi-http"] }
 wrpc-runtime-wasmtime = { workspace = true }

@@ -24,33 +24,34 @@ spec:
       properties:
         # To use the locally compiled code in this folder, use the line below instead after running `wash build`:
         # image: file://./build/blobby_s.wasm
-        image: ghcr.io/wasmcloud/components/blobby-rust:0.4.0
+        image: ghcr.io/wasmcloud/components/blobby-rust:0.5.0
       traits:
         - type: spreadscaler
           properties:
-            instances: 1
+            instances: 100
         # Establish a unidirectional link to the blobstore,
         # so the `blobby` component can make use of blobstore functionality
         # (i.e. reading/writing data blobs)
         - type: link
           properties:
-            target: blobstore
+            target:
+              name: blobstore
+              config:
+                - name: root-directory
+                  properties:
+                    root: '/tmp/blobstore'
             namespace: wasi
             package: blobstore
             interfaces: [blobstore]
-            target_config:
-              - name: root-directory
-                properties:
-                  root: '/tmp/blobstore'
 
     # Capability Providers
     - name: http
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/http-server:0.23.1
+        image: ghcr.io/wasmcloud/http-server:0.27.0
       traits:
         # Link the httpserver to the component, and configure the HTTP server
-        # to listen on port 8080 for incoming requests
+        # to listen on port 8000 for incoming requests
         #
         # Since the HTTP server calls the `blobby` component, we establish
         # a unidirectional link from this `httpserver` provider (the "source")
@@ -58,15 +59,17 @@ spec:
         # the component to handle a request.
         - type: link
           properties:
-            target: blobby
+            target:
+              name: blobby
             namespace: wasi
             package: http
             interfaces: [incoming-handler]
-            source_config:
-              - name: default-http
-                properties:
-                  address: 0.0.0.0:8080
+            source:
+              config:
+                - name: default-http
+                  properties:
+                    address: 0.0.0.0:8000
     - name: blobstore
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/blobstore-fs:0.10.1
+        image: ghcr.io/wasmcloud/blobstore-fs:0.11.0

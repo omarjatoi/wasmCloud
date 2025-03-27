@@ -1,7 +1,8 @@
 name = "Blobstore S3"
 language = "rust"
-version = "0.10.0"
+version = "0.12.0"
 type = "provider"
+wit = "../../../crates/provider-blobstore-s3/wit"
 
 [rust]
 target_dir = "../../../"

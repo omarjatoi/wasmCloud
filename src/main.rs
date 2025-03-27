@@ -1,3 +1,5 @@
+use core::net::SocketAddr;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
@@ -6,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use nkeys::KeyPair;
 use regex::Regex;
 use tokio::time::{timeout, timeout_at};
@@ -18,11 +20,13 @@ use wasmcloud_core::{OtelConfig, OtelProtocol};
 use wasmcloud_host::oci::Config as OciConfig;
 use wasmcloud_host::url::Url;
 use wasmcloud_host::wasmbus::host_config::PolicyService as PolicyServiceConfig;
+use wasmcloud_host::wasmbus::Features;
 use wasmcloud_host::WasmbusHostConfig;
 use wasmcloud_tracing::configure_observability;
 
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
+#[clap(name = "wasmcloud")]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Controls the verbosity of traces emitted from the wasmCloud host
@@ -339,7 +343,11 @@ struct Args {
     flame_graph: Option<String>,
 
     /// Configures the set of certificate authorities as repeatable set of file paths to load into the OCI and OpenTelemetry clients
-    #[arg(long = "tls-ca-path")]
+    #[arg(
+        long = "tls-ca-path",
+        env = "WASMCLOUD_TLS_CA_PATH",
+        value_delimiter = ','
+    )]
     pub tls_ca_paths: Option<Vec<PathBuf>>,
 
     /// If provided, overrides the default heartbeat interval of every 30 seconds. Provided value is interpreted as seconds.
@@ -349,6 +357,41 @@ struct Args {
     /// If provided, overrides the default heartbeat interval of every 30 seconds. Provided value is interpreted as seconds.
     #[arg(long = "heartbeat-interval", env = "WASMCLOUD_HEARTBEAT_INTERVAL", value_parser = parse_duration_fallback_secs, hide = true)]
     heartbeat_interval: Option<Duration>,
+
+    /// Experimental features to enable in the host. This is a repeatable option.
+    #[arg(
+        long = "feature",
+        env = "WASMCLOUD_EXPERIMENTAL_FEATURES",
+        value_delimiter = ',',
+        hide = true
+    )]
+    experimental_features: Vec<Features>,
+
+    #[clap(
+        long = "help-markdown",
+        action=ArgAction::SetTrue,
+        conflicts_with = "help",
+        hide = true
+    )]
+    help_markdown: bool,
+
+    #[clap(long = "http-admin", env = "WASMCLOUD_HTTP_ADMIN")]
+    /// HTTP administration endpoint address
+    http_admin: Option<SocketAddr>,
+
+    #[clap(
+        long = "enable-component-auction",
+        env = "WASMCLOUD_COMPONENT_AUCTION_ENABLED"
+    )]
+    /// Determines whether component auctions should be enabled (defaults to true)
+    enable_component_auction: Option<bool>,
+
+    #[clap(
+        long = "enable-provider-auction",
+        env = "WASMCLOUD_PROVIDER_AUCTION_ENABLED"
+    )]
+    /// Determines whether capability provider auctions should be enabled (defaults to true)
+    enable_provider_auction: Option<bool>,
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -357,6 +400,12 @@ const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     let args: Args = Args::parse();
+
+    // Implements clap_markdown for markdown generation of command line documentation.`
+    if args.help_markdown {
+        clap_markdown::print_help_markdown::<Args>();
+        std::process::exit(0);
+    }
 
     if let Some(tls_ca_paths) = args.tls_ca_paths.clone() {
         ensure_certs_for_paths(tls_ca_paths)?;
@@ -375,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
         protocol: args.observability_protocol.unwrap_or_default(),
         additional_ca_paths: args.tls_ca_paths.clone().unwrap_or_default(),
         trace_level,
+        ..Default::default()
     };
     let log_level = WasmcloudLogLevel::from(args.log_level);
 
@@ -393,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
             Some(guard)
         }
         Err(e) => {
-            eprintln!("Failed to configure observability: {e}");
+            eprintln!("Failed to configure observability: {e:?}");
             None
         }
     };
@@ -531,6 +581,11 @@ async fn main() -> anyhow::Result<()> {
             args.heartbeat_interval.unwrap_or(Duration::from_secs(30)),
             Duration::from_secs(30),
         )),
+        // NOTE(brooks): Summing the feature flags "OR"s the multiple flags together.
+        experimental_features: args.experimental_features.into_iter().sum(),
+        http_admin: args.http_admin,
+        enable_component_auction: args.enable_component_auction.unwrap_or(true),
+        enable_provider_auction: args.enable_provider_auction.unwrap_or(true),
     }))
     .await
     .context("failed to initialize host")?;

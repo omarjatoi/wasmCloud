@@ -1,71 +1,84 @@
-use std::collections::btree_map::Entry as BTreeMapEntry;
-use std::collections::hash_map::{self, Entry};
-use std::collections::{BTreeMap, HashMap};
-use std::env;
+#![allow(clippy::type_complexity)]
+
+use core::sync::atomic::Ordering;
+
+use std::collections::hash_map::Entry;
+use std::collections::{hash_map, BTreeMap, HashMap};
 use std::env::consts::{ARCH, FAMILY, OS};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context as _};
-use async_nats::jetstream::kv::{Entry as KvEntry, Operation, Store};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use async_nats::jetstream::kv::Store;
 use bytes::{BufMut, Bytes, BytesMut};
+use claims::{Claims, StoredClaims};
 use cloudevents::{EventBuilder, EventBuilderV10};
+use ctl::ControlInterfaceServer;
 use futures::future::Either;
 use futures::stream::{AbortHandle, Abortable, SelectAll};
 use futures::{join, stream, try_join, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use nkeys::{KeyPair, KeyPairType, XKey};
-use secrecy::Secret;
+use providers::Provider;
+use secrecy::SecretBox;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
+use sysinfo::System;
+use tokio::io::AsyncWrite;
+use tokio::net::TcpListener;
+use tokio::spawn;
+use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval_at, Instant};
-use tokio::{process, select, spawn};
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{debug, error, info, instrument, trace, warn, Instrument as _};
-use uuid::Uuid;
-use wascap::{jwt, prelude::ClaimsBuilder};
+use tracing::{debug, debug_span, error, info, instrument, trace, warn, Instrument as _};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use wascap::jwt;
 use wasmcloud_control_interface::{
     ComponentAuctionAck, ComponentAuctionRequest, ComponentDescription, CtlResponse,
-    DeleteInterfaceLinkDefinitionRequest, HostInventory, HostLabel, Link, ProviderAuctionAck,
-    ProviderAuctionRequest, ProviderDescription, RegistryCredential, ScaleComponentCommand,
-    StartProviderCommand, StopHostCommand, StopProviderCommand, UpdateComponentCommand,
+    DeleteInterfaceLinkDefinitionRequest, HostInventory, HostLabel, HostLabelIdentifier, Link,
+    ProviderAuctionAck, ProviderAuctionRequest, ProviderDescription, RegistryCredential,
+    ScaleComponentCommand, StartProviderCommand, StopHostCommand, StopProviderCommand,
+    UpdateComponentCommand,
 };
-use wasmcloud_core::{
-    provider_config_update_subject, ComponentId, HealthCheckResponse, HostData, OtelConfig,
-    CTL_API_VERSION_1,
-};
+use wasmcloud_core::{ComponentId, CTL_API_VERSION_1};
 use wasmcloud_runtime::capability::secrets::store::SecretValue;
 use wasmcloud_runtime::component::WrpcServeEvent;
 use wasmcloud_runtime::Runtime;
 use wasmcloud_secrets_types::SECRET_PREFIX;
 use wasmcloud_tracing::context::TraceContextInjector;
-use wasmcloud_tracing::{global, KeyValue};
+use wasmcloud_tracing::{global, InstrumentationScope, KeyValue};
 
 use crate::registry::RegistryCredentialExt;
+use crate::wasmbus::jetstream::create_bucket;
+use crate::workload_identity::WorkloadIdentityConfig;
 use crate::{
     fetch_component, HostMetrics, OciConfig, PolicyHostInfo, PolicyManager, PolicyResponse,
-    RegistryAuth, RegistryConfig, RegistryType, SecretsManager,
+    RegistryAuth, RegistryConfig, RegistryType, ResourceRef, SecretsManager,
 };
 
+mod claims;
+mod ctl;
 mod event;
+mod experimental;
 mod handler;
+mod jetstream;
+mod providers;
 
 pub mod config;
 /// wasmCloud host configuration
 pub mod host_config;
 
+pub use self::experimental::Features;
 pub use self::host_config::Host as HostConfig;
+pub use jetstream::ComponentSpecification;
 
 use self::config::{BundleGenerator, ConfigBundle};
 use self::handler::Handler;
@@ -134,17 +147,16 @@ impl Queue {
         topic_prefix: &str,
         lattice: &str,
         host_key: &KeyPair,
+        component_auction: bool,
+        provider_auction: bool,
     ) -> anyhow::Result<Self> {
         let host_id = host_key.public_key();
-        let streams = futures::future::join_all([
+        let mut subs = vec![
             Either::Left(nats.subscribe(format!(
                 "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.registry.put",
             ))),
             Either::Left(nats.subscribe(format!(
                 "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.host.ping",
-            ))),
-            Either::Left(nats.subscribe(format!(
-                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.*.auction",
             ))),
             Either::Right(nats.queue_subscribe(
                 format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.link.*"),
@@ -170,11 +182,22 @@ impl Queue {
                 format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.config.>"),
                 format!("{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.config"),
             )),
-        ])
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, async_nats::SubscribeError>>()
-        .context("failed to subscribe to queues")?;
+        ];
+        if component_auction {
+            subs.push(Either::Left(nats.subscribe(format!(
+                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.component.auction",
+            ))));
+        }
+        if provider_auction {
+            subs.push(Either::Left(nats.subscribe(format!(
+                "{topic_prefix}.{CTL_API_VERSION_1}.{lattice}.provider.auction",
+            ))));
+        }
+        let streams = futures::future::join_all(subs)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, async_nats::SubscribeError>>()
+            .context("failed to subscribe to queues")?;
         Ok(Self {
             all_streams: futures::stream::select_all(streams),
         })
@@ -194,6 +217,8 @@ struct Component {
     /// Maximum number of instances of this component that can be running at once
     max_instances: NonZeroUsize,
     image_reference: Arc<str>,
+    events: mpsc::Sender<WrpcServeEvent<<WrpcServer as wrpc_transport::Serve>::Context>>,
+    permits: Arc<Semaphore>,
 }
 
 impl Deref for Component {
@@ -212,12 +237,25 @@ struct WrpcServer {
     image_reference: Arc<str>,
     annotations: Arc<Annotations>,
     policy_manager: Arc<PolicyManager>,
-    trace_ctx: Arc<RwLock<Vec<(String, String)>>>,
     metrics: Arc<HostMetrics>,
 }
 
+struct InvocationContext {
+    start_at: Instant,
+    attributes: Vec<KeyValue>,
+    span: tracing::Span,
+}
+
+impl Deref for InvocationContext {
+    type Target = tracing::Span;
+
+    fn deref(&self) -> &Self::Target {
+        &self.span
+    }
+}
+
 impl wrpc_transport::Serve for WrpcServer {
-    type Context = (Instant, Vec<KeyValue>);
+    type Context = InvocationContext;
     type Outgoing = <wrpc_transport_nats::Client as wrpc_transport::Serve>::Outgoing;
     type Incoming = <wrpc_transport_nats::Client as wrpc_transport::Serve>::Incoming;
 
@@ -248,108 +286,76 @@ impl wrpc_transport::Serve for WrpcServer {
         let image_reference = Arc::clone(&self.image_reference);
         let metrics = Arc::clone(&self.metrics);
         let policy_manager = Arc::clone(&self.policy_manager);
-        let trace_ctx = Arc::clone(&self.trace_ctx);
         let claims = self.claims.clone();
         Ok(invocations.and_then(move |(cx, tx, rx)| {
-            {
-                let annotations = Arc::clone(&annotations);
-                let claims = claims.clone();
-                let func = Arc::clone(&func);
-                let id = Arc::clone(&id);
-                let image_reference = Arc::clone(&image_reference);
-                let instance = Arc::clone(&instance);
-                let metrics = Arc::clone(&metrics);
-                let policy_manager = Arc::clone(&policy_manager);
-                let trace_ctx = Arc::clone(&trace_ctx);
-                async move {
-                    let PolicyResponse {
-                        request_id,
-                        permitted,
-                        message,
-                    } = policy_manager
-                        .evaluate_perform_invocation(
-                            &id,
-                            &image_reference,
-                            &annotations,
-                            claims.as_deref(),
-                            instance.to_string(),
-                            func.to_string(),
-                        )
-                        .await?;
-                    ensure!(
-                        permitted,
-                        "policy denied request to invoke component `{request_id}`: `{message:?}`",
-                    );
-
-                    if let Some(ref cx) = cx {
-                        // TODO: wasmcloud_tracing take HeaderMap for my own sanity
-                        // Coerce the HashMap<String, Vec<String>> into a Vec<(String, String)> by
-                        // flattening the values
-                        let trace_context = cx
-                            .iter()
-                            .flat_map(|(key, value)| {
-                                value
-                                    .iter()
-                                    .map(|v| (key.to_string(), v.to_string()))
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<(String, String)>>();
-                        wasmcloud_tracing::context::attach_span_context(&trace_context);
-                    }
-
-                    // Associate the current context with the span
-                    let injector = TraceContextInjector::default_with_span();
-                    *trace_ctx.write().await = injector
+            let annotations = Arc::clone(&annotations);
+            let claims = claims.clone();
+            let func = Arc::clone(&func);
+            let id = Arc::clone(&id);
+            let image_reference = Arc::clone(&image_reference);
+            let instance = Arc::clone(&instance);
+            let metrics = Arc::clone(&metrics);
+            let policy_manager = Arc::clone(&policy_manager);
+            let span = tracing::info_span!("component_invocation", func = %func, id = %id, instance = %instance);
+            async move {
+                if let Some(ref cx) = cx {
+                    // Coerce the HashMap<String, Vec<String>> into a Vec<(String, String)> by
+                    // flattening the values
+                    let trace_context = cx
                         .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect();
-                    Ok((
-                        (
-                            Instant::now(),
-                            // TODO(metrics): insert information about the source once we have concrete context data
-                            vec![
-                                KeyValue::new("component.ref", image_reference),
-                                KeyValue::new("lattice", metrics.lattice_id.clone()),
-                                KeyValue::new("host", metrics.host_id.clone()),
-                                KeyValue::new("operation", format!("{instance}/{func}")),
-                            ],
-                        ),
-                        tx,
-                        rx,
-                    ))
+                        .flat_map(|(key, value)| {
+                            value
+                                .iter()
+                                .map(|v| (key.to_string(), v.to_string()))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<(String, String)>>();
+                    span.set_parent(wasmcloud_tracing::context::get_span_context(&trace_context));
                 }
+
+                let PolicyResponse {
+                    request_id,
+                    permitted,
+                    message,
+                } = policy_manager
+                    .evaluate_perform_invocation(
+                        &id,
+                        &image_reference,
+                        &annotations,
+                        claims.as_deref(),
+                        instance.to_string(),
+                        func.to_string(),
+                    )
+                    .instrument(debug_span!(parent: &span, "policy_check"))
+                    .await?;
+                ensure!(
+                    permitted,
+                    "policy denied request to invoke component `{request_id}`: `{message:?}`",
+                );
+
+                Ok((
+                    InvocationContext{
+                        start_at: Instant::now(),
+                        // TODO(metrics): insert information about the source once we have concrete context data
+                        attributes: vec![
+                            KeyValue::new("component.ref", image_reference),
+                            KeyValue::new("lattice", metrics.lattice_id.clone()),
+                            KeyValue::new("host", metrics.host_id.clone()),
+                            KeyValue::new("operation", format!("{instance}/{func}")),
+                        ],
+                        span,
+                    },
+                    tx,
+                    rx,
+                ))
             }
-            .in_current_span()
         }))
-    }
-}
-
-/// An Provider instance
-#[derive(Debug)]
-struct Provider {
-    image_ref: String,
-    claims_token: Option<jwt::Token<jwt::CapabilityProvider>>,
-    xkey: XKey,
-    annotations: Annotations,
-    /// Task that continuously performs health checks against the provider
-    health_check_task: JoinHandle<()>,
-    /// Task that continuously forwards configuration updates to the provider
-    config_update_task: JoinHandle<()>,
-    /// Config bundle for the aggregated configuration being watched by the provider
-    #[allow(unused)]
-    config: Arc<RwLock<ConfigBundle>>,
-}
-
-impl Drop for Provider {
-    fn drop(&mut self) {
-        self.health_check_task.abort();
-        self.config_update_task.abort();
     }
 }
 
 /// wasmCloud Host
 pub struct Host {
-    components: RwLock<HashMap<ComponentId, Arc<Component>>>,
+    components: Arc<RwLock<HashMap<ComponentId, Arc<Component>>>>,
     event_builder: EventBuilderV10,
     friendly_name: String,
     heartbeat: AbortHandle,
@@ -358,7 +364,7 @@ pub struct Host {
     host_token: Arc<jwt::Token<jwt::Host>>,
     /// The Xkey used to encrypt secrets when sending them over NATS
     secrets_xkey: Arc<XKey>,
-    labels: RwLock<BTreeMap<String, String>>,
+    labels: Arc<RwLock<BTreeMap<String, String>>>,
     ctl_topic_prefix: String,
     /// NATS client to use for control interface subscriptions and jetstream queries
     ctl_nats: async_nats::Client,
@@ -385,166 +391,119 @@ pub struct Host {
     provider_claims: Arc<RwLock<HashMap<String, jwt::Claims<jwt::CapabilityProvider>>>>,
     metrics: Arc<HostMetrics>,
     max_execution_time: Duration,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-/// The specification of a component that is or did run in the lattice. This contains all of the information necessary to
-/// instantiate a component in the lattice (url and digest) as well as configuration and links in order to facilitate
-/// runtime execution of the component. Each `import` in a component's WIT world will need a corresponding link for the
-/// host runtime to route messages to the correct component.
-pub struct ComponentSpecification {
-    /// The URL of the component, file, OCI, or otherwise
-    url: String,
-    /// All outbound links from this component to other components, used for routing when calling a component `import`
-    links: Vec<Link>,
-    ////
-    // Possible additions in the future, left in as comments to facilitate discussion
-    ////
-    // /// The claims embedded in the component, if present
-    // claims: Option<Claims>,
-    // /// SHA256 digest of the component, used for checking uniqueness of component IDs
-    // digest: String
-    // /// (Advanced) Additional routing topics to subscribe on in addition to the component ID.
-    // routing_groups: Vec<String>,
-}
-
-impl ComponentSpecification {
-    /// Create a new empty component specification with the given ID and URL
-    pub fn new(url: impl AsRef<str>) -> Self {
-        Self {
-            url: url.as_ref().to_string(),
-            links: Vec::new(),
-        }
-    }
-}
-
-#[allow(clippy::large_enum_variant)] // Without this clippy complains component is at least 0 bytes while provider is at least 280 bytes. That doesn't make sense
-enum Claims {
-    Component(jwt::Claims<jwt::Component>),
-    Provider(jwt::Claims<jwt::CapabilityProvider>),
-}
-
-impl Claims {
-    fn subject(&self) -> &str {
-        match self {
-            Claims::Component(claims) => &claims.subject,
-            Claims::Provider(claims) => &claims.subject,
-        }
-    }
-}
-
-impl From<StoredClaims> for Claims {
-    fn from(claims: StoredClaims) -> Self {
-        match claims {
-            StoredClaims::Component(claims) => {
-                let name = (!claims.name.is_empty()).then_some(claims.name);
-                let rev = claims.revision.parse().ok();
-                let ver = (!claims.version.is_empty()).then_some(claims.version);
-                let tags = (!claims.tags.is_empty()).then_some(claims.tags);
-                let call_alias = (!claims.call_alias.is_empty()).then_some(claims.call_alias);
-                let metadata = jwt::Component {
-                    name,
-                    tags,
-                    rev,
-                    ver,
-                    call_alias,
-                    ..Default::default()
-                };
-                let claims = ClaimsBuilder::new()
-                    .subject(&claims.subject)
-                    .issuer(&claims.issuer)
-                    .with_metadata(metadata)
-                    .build();
-                Claims::Component(claims)
-            }
-            StoredClaims::Provider(claims) => {
-                let name = (!claims.name.is_empty()).then_some(claims.name);
-                let rev = claims.revision.parse().ok();
-                let ver = (!claims.version.is_empty()).then_some(claims.version);
-                let config_schema: Option<serde_json::Value> = claims
-                    .config_schema
-                    .and_then(|schema| serde_json::from_str(&schema).ok());
-                let metadata = jwt::CapabilityProvider {
-                    name,
-                    rev,
-                    ver,
-                    config_schema,
-                    ..Default::default()
-                };
-                let claims = ClaimsBuilder::new()
-                    .subject(&claims.subject)
-                    .issuer(&claims.issuer)
-                    .with_metadata(metadata)
-                    .build();
-                Claims::Provider(claims)
-            }
-        }
-    }
-}
-
-#[instrument(level = "debug", skip_all)]
-async fn create_bucket(
-    jetstream: &async_nats::jetstream::Context,
-    bucket: &str,
-) -> anyhow::Result<Store> {
-    // Don't create the bucket if it already exists
-    if let Ok(store) = jetstream.get_key_value(bucket).await {
-        info!(%bucket, "bucket already exists. Skipping creation.");
-        return Ok(store);
-    }
-
-    match jetstream
-        .create_key_value(async_nats::jetstream::kv::Config {
-            bucket: bucket.to_string(),
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => {
-            info!(%bucket, "created bucket with 1 replica");
-            Ok(store)
-        }
-        Err(err) => Err(anyhow!(err).context(format!("failed to create bucket '{bucket}'"))),
-    }
+    messaging_links:
+        Arc<RwLock<HashMap<Arc<str>, Arc<RwLock<HashMap<Box<str>, async_nats::Client>>>>>>,
+    /// Experimental features to enable in the host that gate functionality
+    experimental_features: Features,
+    ready: Arc<AtomicBool>,
+    /// A set of host tasks
+    #[allow(unused)]
+    tasks: JoinSet<()>,
 }
 
 /// Given the NATS address, authentication jwt, seed, tls requirement and optional request timeout,
 /// attempt to establish connection.
 ///
+/// This function should be used to create a NATS client for Host communication, for non-host NATS
+/// clients we recommend using async-nats directly.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Only one of JWT or seed is specified, as we cannot authenticate with only one of them
 /// - Connection fails
-async fn connect_nats(
+pub async fn connect_nats(
     addr: impl async_nats::ToServerAddrs,
     jwt: Option<&String>,
     key: Option<Arc<KeyPair>>,
     require_tls: bool,
     request_timeout: Option<Duration>,
+    workload_identity_config: Option<WorkloadIdentityConfig>,
 ) -> anyhow::Result<async_nats::Client> {
-    let opts = async_nats::ConnectOptions::new().require_tls(require_tls);
-    let opts = match (jwt, key) {
-        (Some(jwt), Some(key)) => opts.jwt(jwt.to_string(), {
-            move |nonce| {
+    let opts = match (jwt, key, workload_identity_config) {
+        (Some(jwt), Some(key), None) => {
+            async_nats::ConnectOptions::with_jwt(jwt.to_string(), move |nonce| {
                 let key = key.clone();
                 async move { key.sign(&nonce).map_err(async_nats::AuthError::new) }
-            }
-        }),
-        (Some(_), None) | (None, Some(_)) => {
+            })
+        }
+        (Some(_), None, _) | (None, Some(_), _) => {
             bail!("cannot authenticate if only one of jwt or seed is specified")
         }
-        _ => opts,
+        (jwt, key, Some(wid_cfg)) => {
+            setup_workload_identity_nats_connect_options(jwt, key, wid_cfg).await?
+        }
+        _ => async_nats::ConnectOptions::new(),
     };
     let opts = if let Some(timeout) = request_timeout {
         opts.request_timeout(Some(timeout))
     } else {
         opts
     };
+    let opts = opts.require_tls(require_tls);
     opts.connect(addr)
         .await
         .context("failed to connect to NATS")
+}
+
+#[cfg(unix)]
+async fn setup_workload_identity_nats_connect_options(
+    jwt: Option<&String>,
+    key: Option<Arc<KeyPair>>,
+    wid_cfg: WorkloadIdentityConfig,
+) -> anyhow::Result<async_nats::ConnectOptions> {
+    let wid_cfg = Arc::new(wid_cfg);
+    let jwt = jwt.map(String::to_string).map(Arc::new);
+    let key = key.clone();
+
+    // Return an auth callback that'll get called any time the
+    // NATS connection needs to be (re-)established. This is
+    // necessary to ensure that we always provide a recently
+    // issued JWT-SVID.
+    Ok(async_nats::ConnectOptions::with_auth_callback(
+        move |nonce| {
+            let key = key.clone();
+            let jwt = jwt.clone();
+            let wid_cfg = wid_cfg.clone();
+
+            let fetch_svid_handle = tokio::spawn(async move {
+                let mut client = spiffe::WorkloadApiClient::default()
+                    .await
+                    .map_err(async_nats::AuthError::new)?;
+                client
+                    .fetch_jwt_svid(&[wid_cfg.auth_service_audience.as_str()], None)
+                    .await
+                    .map_err(async_nats::AuthError::new)
+            });
+
+            async move {
+                let svid = fetch_svid_handle
+                    .await
+                    .map_err(async_nats::AuthError::new)?
+                    .map_err(async_nats::AuthError::new)?;
+
+                let mut auth = async_nats::Auth::new();
+                if let Some(key) = key {
+                    let signature = key.sign(&nonce).map_err(async_nats::AuthError::new)?;
+                    auth.signature = Some(signature);
+                }
+                if let Some(jwt) = jwt {
+                    auth.jwt = Some(jwt.to_string());
+                }
+                auth.token = Some(svid.token().into());
+                Ok(auth)
+            }
+        },
+    ))
+}
+
+#[cfg(target_family = "windows")]
+async fn setup_workload_identity_nats_connect_options(
+    jwt: Option<&String>,
+    key: Option<Arc<KeyPair>>,
+    wid_cfg: WorkloadIdentityConfig,
+) -> anyhow::Result<async_nats::ConnectOptions> {
+    bail!("workload identity is not supported on Windows")
 }
 
 #[derive(Debug, Default)]
@@ -619,7 +578,7 @@ async fn merge_registry_config(
         match registry_config.entry(reg.clone()) {
             Entry::Occupied(_entry) => {
                 // note we don't update config here, since the config service should take priority
-                warn!(oci_registry_url = %reg, "ignoring OCI registry config, overriden by config service");
+                warn!(oci_registry_url = %reg, "ignoring OCI registry config, overridden by config service");
             }
             Entry::Vacant(entry) => {
                 debug!(oci_registry_url = %reg, "set registry config");
@@ -747,6 +706,12 @@ impl Host {
             "version": config.version,
         });
 
+        let workload_identity_config = if config.experimental_features.workload_identity_auth {
+            Some(WorkloadIdentityConfig::from_env()?)
+        } else {
+            None
+        };
+
         let ((ctl_nats, queue), rpc_nats) = try_join!(
             async {
                 debug!(
@@ -759,6 +724,7 @@ impl Host {
                     config.ctl_key.clone(),
                     config.ctl_tls,
                     None,
+                    workload_identity_config.clone(),
                 )
                 .await
                 .context("failed to establish NATS control server connection")?;
@@ -767,6 +733,8 @@ impl Host {
                     &config.ctl_topic_prefix,
                     &config.lattice,
                     &host_key,
+                    config.enable_component_auction,
+                    config.enable_provider_auction,
                 )
                 .await
                 .context("failed to initialize queue")?;
@@ -784,6 +752,7 @@ impl Host {
                     config.rpc_key.clone(),
                     config.rpc_tls,
                     Some(config.rpc_timeout),
+                    workload_identity_config.clone(),
                 )
                 .await
                 .context("failed to establish NATS RPC server connection")
@@ -807,6 +776,7 @@ impl Host {
             .max_linear_memory(config.max_linear_memory)
             .max_components(config.max_components)
             .max_component_size(config.max_component_size)
+            .experimental_features(config.experimental_features.into())
             .build()
             .context("failed to build runtime")?;
         let event_builder = EventBuilderV10::new().source(host_key.public_key());
@@ -865,23 +835,114 @@ impl Host {
             &ctl_nats,
         ));
 
-        let meter = global::meter_with_version(
-            "wasmcloud-host",
-            Some(config.version.clone()),
-            None::<&str>,
-            Some(vec![
+        let scope = InstrumentationScope::builder("wasmcloud-host")
+            .with_version(config.version.clone())
+            .with_attributes(vec![
                 KeyValue::new("host.id", host_key.public_key()),
                 KeyValue::new("host.version", config.version.clone()),
-            ]),
-        );
-        let metrics = HostMetrics::new(&meter, host_key.public_key(), config.lattice.to_string());
+                KeyValue::new("host.arch", ARCH),
+                KeyValue::new("host.os", OS),
+                KeyValue::new("host.osfamily", FAMILY),
+                KeyValue::new("host.friendly_name", friendly_name.clone()),
+                KeyValue::new("host.hostname", System::host_name().unwrap_or_default()),
+                KeyValue::new(
+                    "host.kernel_version",
+                    System::kernel_version().unwrap_or_default(),
+                ),
+                KeyValue::new("host.os_version", System::os_version().unwrap_or_default()),
+            ])
+            .build();
+        let meter = global::meter_with_scope(scope);
+        let metrics = HostMetrics::new(
+            &meter,
+            host_key.public_key(),
+            config.lattice.to_string(),
+            None,
+        )
+        .context("failed to create HostMetrics instance")?;
 
         let config_generator = BundleGenerator::new(config_data.clone());
 
         let max_execution_time_ms = config.max_execution_time;
 
+        debug!("Feature flags: {:?}", config.experimental_features);
+
+        let mut tasks = JoinSet::new();
+        let ready = Arc::new(AtomicBool::new(true));
+        if let Some(addr) = config.http_admin {
+            let socket = TcpListener::bind(addr)
+                .await
+                .context("failed to bind on HTTP administration endpoint")?;
+            let ready = Arc::clone(&ready);
+            let svc = hyper::service::service_fn(move |req| {
+                const OK: &str = r#"{"status":"ok"}"#;
+                const FAIL: &str = r#"{"status":"failure"}"#;
+                let ready = Arc::clone(&ready);
+                async move {
+                    let (http::request::Parts { method, uri, .. }, _) = req.into_parts();
+                    match (method.as_str(), uri.path()) {
+                        ("HEAD", "/livez") => Ok(http::Response::default()),
+                        ("GET", "/livez") => Ok(http::Response::new(http_body_util::Full::new(
+                            Bytes::from(OK),
+                        ))),
+                        (method, "/livez") => http::Response::builder()
+                            .status(http::StatusCode::METHOD_NOT_ALLOWED)
+                            .body(http_body_util::Full::new(Bytes::from(format!(
+                                "method `{method}` not supported for path `/livez`"
+                            )))),
+                        ("HEAD", "/readyz") => {
+                            if ready.load(Ordering::Relaxed) {
+                                Ok(http::Response::default())
+                            } else {
+                                http::Response::builder()
+                                    .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(http_body_util::Full::default())
+                            }
+                        }
+                        ("GET", "/readyz") => {
+                            if ready.load(Ordering::Relaxed) {
+                                Ok(http::Response::new(http_body_util::Full::new(Bytes::from(
+                                    OK,
+                                ))))
+                            } else {
+                                http::Response::builder()
+                                    .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(http_body_util::Full::new(Bytes::from(FAIL)))
+                            }
+                        }
+                        (method, "/readyz") => http::Response::builder()
+                            .status(http::StatusCode::METHOD_NOT_ALLOWED)
+                            .body(http_body_util::Full::new(Bytes::from(format!(
+                                "method `{method}` not supported for path `/readyz`"
+                            )))),
+                        (.., path) => http::Response::builder()
+                            .status(http::StatusCode::NOT_FOUND)
+                            .body(http_body_util::Full::new(Bytes::from(format!(
+                                "unknown endpoint `{path}`"
+                            )))),
+                    }
+                }
+            });
+            let srv = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            tasks.spawn(async move {
+                loop {
+                    let stream = match socket.accept().await {
+                        Ok((stream, _)) => stream,
+                        Err(err) => {
+                            error!(?err, "failed to accept HTTP administration connection");
+                            continue;
+                        }
+                    };
+                    let svc = svc.clone();
+                    if let Err(err) = srv.serve_connection(TokioIo::new(stream), svc).await {
+                        error!(?err, "failed to serve HTTP administration connection");
+                    }
+                }
+            });
+        }
+
         let host = Host {
-            components: RwLock::default(),
+            components: Arc::default(),
             event_builder,
             friendly_name,
             heartbeat: heartbeat_abort.clone(),
@@ -889,9 +950,10 @@ impl Host {
             host_key,
             host_token,
             secrets_xkey: Arc::new(XKey::new()),
-            labels: RwLock::new(labels),
+            labels: Arc::new(RwLock::new(labels)),
             ctl_nats,
             rpc_nats: Arc::new(rpc_nats),
+            experimental_features: config.experimental_features,
             host_config: config,
             data: data.clone(),
             data_watch: data_watch_abort.clone(),
@@ -911,6 +973,9 @@ impl Host {
             provider_claims: Arc::default(),
             metrics: Arc::new(metrics),
             max_execution_time: max_execution_time_ms,
+            messaging_links: Arc::default(),
+            ready: Arc::clone(&ready),
+            tasks,
         };
 
         let host = Arc::new(host);
@@ -958,7 +1023,7 @@ impl Host {
                                     Err(error) => {
                                         error!("failed to watch lattice data bucket: {error}");
                                     }
-                                    Ok(entry) => host.process_entry(entry, true).await,
+                                    Ok(entry) => host.process_entry(entry).await,
                                 }
                             }
                         }
@@ -1025,7 +1090,7 @@ impl Host {
             })
             .for_each(|entry| async {
                 match entry {
-                    Ok(entry) => host.process_entry(entry, false).await,
+                    Ok(entry) => host.process_entry(entry).await,
                     Err(err) => error!(%err, "failed to read entry from lattice data bucket"),
                 }
             })
@@ -1040,6 +1105,7 @@ impl Host {
         );
 
         Ok((Arc::clone(&host), async move {
+            ready.store(false, Ordering::Relaxed);
             heartbeat_abort.abort();
             queue_abort.abort();
             data_watch_abort.abort();
@@ -1055,7 +1121,7 @@ impl Host {
             .context("failed to publish stop event")?;
             // Before we exit, make sure to flush all messages or we may lose some that we've
             // thought were sent (like the host_stopped event)
-            try_join!(host.ctl_nats.flush(), host.rpc_nats.flush(),)
+            try_join!(host.ctl_nats.flush(), host.rpc_nats.flush())
                 .context("failed to flush NATS clients")?;
             Ok(())
         }))
@@ -1080,39 +1146,41 @@ impl Host {
     #[instrument(level = "debug", skip_all)]
     async fn inventory(&self) -> HostInventory {
         trace!("generating host inventory");
-        let components = self.components.read().await;
-        let components: Vec<_> = stream::iter(components.iter())
-            .filter_map(|(id, component)| async move {
-                let mut description = ComponentDescription::builder()
-                    .id(id.into())
-                    .image_ref(component.image_reference.to_string())
-                    .annotations(component.annotations.clone().into_iter().collect())
-                    .max_instances(component.max_instances.get().try_into().unwrap_or(u32::MAX))
-                    .revision(
-                        component
-                            .claims()
-                            .and_then(|claims| claims.metadata.as_ref())
-                            .and_then(|jwt::Component { rev, .. }| *rev)
-                            .unwrap_or_default(),
-                    );
-                // Add name if present
-                if let Some(name) = component
-                    .claims()
-                    .and_then(|claims| claims.metadata.as_ref())
-                    .and_then(|metadata| metadata.name.as_ref())
-                    .cloned()
-                {
-                    description = description.name(name);
-                };
+        let components: Vec<_> = {
+            let components = self.components.read().await;
+            stream::iter(components.iter())
+                .filter_map(|(id, component)| async move {
+                    let mut description = ComponentDescription::builder()
+                        .id(id.into())
+                        .image_ref(component.image_reference.to_string())
+                        .annotations(component.annotations.clone().into_iter().collect())
+                        .max_instances(component.max_instances.get().try_into().unwrap_or(u32::MAX))
+                        .revision(
+                            component
+                                .claims()
+                                .and_then(|claims| claims.metadata.as_ref())
+                                .and_then(|jwt::Component { rev, .. }| *rev)
+                                .unwrap_or_default(),
+                        );
+                    // Add name if present
+                    if let Some(name) = component
+                        .claims()
+                        .and_then(|claims| claims.metadata.as_ref())
+                        .and_then(|metadata| metadata.name.as_ref())
+                        .cloned()
+                    {
+                        description = description.name(name);
+                    };
 
-                Some(
-                    description
-                        .build()
-                        .expect("failed to build component description: {e}"),
-                )
-            })
-            .collect()
-            .await;
+                    Some(
+                        description
+                            .build()
+                            .expect("failed to build component description: {e}"),
+                    )
+                })
+                .collect()
+                .await
+        };
 
         let providers: Vec<_> = self
             .providers
@@ -1218,24 +1286,25 @@ impl Host {
                 .clamp(MIN_INVOCATION_CHANNEL_SIZE, MAX_INVOCATION_CHANNEL_SIZE),
         );
         let prefix = Arc::from(format!("{}.{id}", &self.host_config.lattice));
+        let nats = wrpc_transport_nats::Client::new(
+            Arc::clone(&self.rpc_nats),
+            Arc::clone(&prefix),
+            Some(prefix),
+        )
+        .await?;
         let exports = component
             .serve_wrpc(
                 &WrpcServer {
-                    nats: wrpc_transport_nats::Client::new(
-                        Arc::clone(&self.rpc_nats),
-                        Arc::clone(&prefix),
-                        Some(prefix),
-                    ),
+                    nats,
                     claims: component.claims().cloned().map(Arc::new),
                     id: Arc::clone(&id),
                     image_reference: Arc::clone(&image_reference),
                     annotations: Arc::new(annotations.clone()),
                     policy_manager: Arc::clone(&self.policy_manager),
-                    trace_ctx: Arc::clone(&handler.trace_ctx),
                     metrics: Arc::clone(&self.metrics),
                 },
                 handler.clone(),
-                events_tx,
+                events_tx.clone(),
             )
             .await?;
         let permits = Arc::new(Semaphore::new(
@@ -1246,77 +1315,83 @@ impl Host {
             component,
             id,
             handler,
-            exports: spawn(
-                async move {
-                    join!(
-                        async move {
-                            let mut tasks = JoinSet::new();
-                            let mut exports = stream::select_all(exports);
-                            loop {
-                                let permits = Arc::clone(&permits);
-                                select! {
-                                    Some(fut) = exports.next() => {
-                                        match fut {
-                                            Ok(fut) => {
-                                                debug!("accepted invocation, acquiring permit");
-                                                let permit = permits.acquire_owned().await;
-                                                tasks.spawn(async move {
-                                                    let _permit = permit;
-                                                    debug!("handling invocation");
-                                                    match fut.await {
-                                                        Ok(()) => {
-                                                            debug!("successfully handled invocation");
-                                                            Ok(())
-                                                        },
-                                                        Err(err) => {
-                                                            warn!(?err, "failed to handle invocation");
-                                                            Err(err)
-                                                        },
-                                                    }
-                                                });
+            events: events_tx,
+            permits: Arc::clone(&permits),
+            exports: spawn(async move {
+                join!(
+                    async move {
+                        let mut exports = stream::select_all(exports);
+                        loop {
+                            let permits = Arc::clone(&permits);
+                            if let Some(fut) = exports.next().await {
+                                match fut {
+                                    Ok(fut) => {
+                                        debug!("accepted invocation, acquiring permit");
+                                        let permit = permits.acquire_owned().await;
+                                        spawn(async move {
+                                            let _permit = permit;
+                                            debug!("handling invocation");
+                                            match fut.await {
+                                                Ok(()) => {
+                                                    debug!("successfully handled invocation");
+                                                    Ok(())
+                                                }
+                                                Err(err) => {
+                                                    warn!(?err, "failed to handle invocation");
+                                                    Err(err)
+                                                }
                                             }
-                                            Err(err) => {
-                                                warn!(?err, "failed to accept invocation")
-                                            }
-                                        }
+                                        });
                                     }
-                                    Some(res) = tasks.join_next() => {
-                                        if let Err(err) = res {
-                                            error!(?err, "export serving task failed");
-                                        }
+                                    Err(err) => {
+                                        warn!(?err, "failed to accept invocation")
                                     }
                                 }
                             }
-                        },
-                        async move {
-                            while let Some(evt) = events_rx.recv().await {
-                                match evt {
-                                    WrpcServeEvent::HttpIncomingHandlerHandleReturned {
-                                        context: (start_at, ref attributes),
-                                        success,
-                                    }
-                                    | WrpcServeEvent::MessagingHandlerHandleMessageReturned {
-                                        context: (start_at, ref attributes),
-                                        success,
-                                    }
-                                    | WrpcServeEvent::DynamicExportReturned {
-                                        context: (start_at, ref attributes),
-                                        success,
-                                    } => metrics.record_component_invocation(
-                                        u64::try_from(start_at.elapsed().as_nanos())
-                                            .unwrap_or_default(),
-                                        attributes,
-                                        !success,
-                                    ),
+                        }
+                    },
+                    async move {
+                        while let Some(evt) = events_rx.recv().await {
+                            match evt {
+                                WrpcServeEvent::HttpIncomingHandlerHandleReturned {
+                                    context:
+                                        InvocationContext {
+                                            start_at,
+                                            ref attributes,
+                                            ..
+                                        },
+                                    success,
                                 }
+                                | WrpcServeEvent::MessagingHandlerHandleMessageReturned {
+                                    context:
+                                        InvocationContext {
+                                            start_at,
+                                            ref attributes,
+                                            ..
+                                        },
+                                    success,
+                                }
+                                | WrpcServeEvent::DynamicExportReturned {
+                                    context:
+                                        InvocationContext {
+                                            start_at,
+                                            ref attributes,
+                                            ..
+                                        },
+                                    success,
+                                } => metrics.record_component_invocation(
+                                    u64::try_from(start_at.elapsed().as_nanos())
+                                        .unwrap_or_default(),
+                                    attributes,
+                                    !success,
+                                ),
                             }
-                            debug!("serving event stream is done");
-                        },
-                    );
-                    debug!("export serving task done");
-                }
-                .in_current_span(),
-            ),
+                        }
+                        debug!("serving event stream is done");
+                    },
+                );
+                debug!("export serving task done");
+            }),
             annotations: annotations.clone(),
             max_instances,
             image_reference,
@@ -1328,14 +1403,14 @@ impl Host {
     async fn start_component<'a>(
         &self,
         entry: hash_map::VacantEntry<'a, String, Arc<Component>>,
-        wasm: Vec<u8>,
+        wasm: &[u8],
         claims: Option<jwt::Claims<jwt::Component>>,
         component_ref: Arc<str>,
         component_id: Arc<str>,
         max_instances: NonZeroUsize,
         annotations: &Annotations,
         config: ConfigBundle,
-        secrets: HashMap<String, Secret<SecretValue>>,
+        secrets: HashMap<String, SecretBox<SecretValue>>,
     ) -> anyhow::Result<&'a mut Arc<Component>> {
         debug!(?component_ref, ?max_instances, "starting new component");
 
@@ -1360,11 +1435,16 @@ impl Host {
             component_id: Arc::clone(&component_id),
             secrets: Arc::new(RwLock::new(secrets)),
             targets: Arc::default(),
-            trace_ctx: Arc::default(),
             instance_links: Arc::new(RwLock::new(component_import_links(&component_spec.links))),
+            messaging_links: {
+                let mut links = self.messaging_links.write().await;
+                Arc::clone(links.entry(Arc::clone(&component_id)).or_default())
+            },
             invocation_timeout: Duration::from_secs(10), // TODO: Make this configurable
+            experimental_features: self.experimental_features,
+            host_labels: Arc::clone(&self.labels),
         };
-        let component = wasmcloud_runtime::Component::new(&self.runtime, &wasm)?;
+        let component = wasmcloud_runtime::Component::new(&self.runtime, wasm)?;
         let component = self
             .instantiate_component(
                 annotations,
@@ -1403,84 +1483,6 @@ impl Host {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_auction_component(
-        &self,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<Option<CtlResponse<ComponentAuctionAck>>> {
-        let req = serde_json::from_slice::<ComponentAuctionRequest>(payload.as_ref())
-            .context("failed to deserialize component auction command")?;
-        let component_ref = req.component_ref();
-        let component_id = req.component_id();
-        let constraints = req.constraints();
-
-        info!(
-            component_ref,
-            component_id,
-            ?constraints,
-            "handling auction for component"
-        );
-
-        let host_labels = self.labels.read().await;
-        let constraints_satisfied = constraints
-            .iter()
-            .all(|(k, v)| host_labels.get(k).is_some_and(|hv| hv == v));
-        let component_id_running = self.components.read().await.contains_key(component_id);
-
-        // This host can run the component if all constraints are satisfied and the component is not already running
-        if constraints_satisfied && !component_id_running {
-            Ok(Some(CtlResponse::ok(
-                ComponentAuctionAck::from_component_host_and_constraints(
-                    component_ref,
-                    component_id,
-                    &self.host_key.public_key(),
-                    constraints.clone(),
-                ),
-            )))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn handle_auction_provider(
-        &self,
-        payload: impl AsRef<[u8]>,
-    ) -> anyhow::Result<Option<CtlResponse<ProviderAuctionAck>>> {
-        let req = serde_json::from_slice::<ProviderAuctionRequest>(payload.as_ref())
-            .context("failed to deserialize provider auction command")?;
-        let provider_ref = req.provider_ref();
-        let provider_id = req.provider_id();
-        let constraints = req.constraints();
-
-        info!(
-            provider_ref,
-            provider_id,
-            ?constraints,
-            "handling auction for provider"
-        );
-
-        let host_labels = self.labels.read().await;
-        let constraints_satisfied = constraints
-            .iter()
-            .all(|(k, v)| host_labels.get(k).is_some_and(|hv| hv == v));
-        let providers = self.providers.read().await;
-        let provider_running = providers.contains_key(provider_id);
-        if constraints_satisfied && !provider_running {
-            Ok(Some(CtlResponse::ok(
-                ProviderAuctionAck::builder()
-                    .provider_ref(provider_ref.into())
-                    .provider_id(provider_id.into())
-                    .constraints(constraints.clone())
-                    .host_id(self.host_key.public_key())
-                    .build()
-                    .map_err(|e| anyhow!("failed to build provider auction ack: {e}"))?,
-            )))
-        } else {
-            Ok(None)
-        }
-    }
-
     #[instrument(level = "trace", skip_all)]
     async fn fetch_component(&self, component_ref: &str) -> anyhow::Result<Vec<u8>> {
         let registry_config = self.registry_config.read().await;
@@ -1502,6 +1504,26 @@ impl Host {
         let mut component_claims = self.component_claims.write().await;
         component_claims.insert(claims.subject.clone(), claims);
         Ok(())
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn handle_auction_component(
+        &self,
+        payload: impl AsRef<[u8]>,
+    ) -> anyhow::Result<Option<CtlResponse<ComponentAuctionAck>>> {
+        let request = serde_json::from_slice::<ComponentAuctionRequest>(payload.as_ref())
+            .context("failed to deserialize component auction command")?;
+        <Self as ControlInterfaceServer>::handle_auction_component(self, request).await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn handle_auction_provider(
+        &self,
+        payload: impl AsRef<[u8]>,
+    ) -> anyhow::Result<Option<CtlResponse<ProviderAuctionAck>>> {
+        let request = serde_json::from_slice::<ProviderAuctionRequest>(payload.as_ref())
+            .context("failed to deserialize provider auction command")?;
+        <Self as ControlInterfaceServer>::handle_auction_provider(self, request).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1536,172 +1558,28 @@ impl Host {
             "invalid host_id [{transport_host_id}]"
         );
 
-        info!(?timeout, "handling stop host");
-
-        self.heartbeat.abort();
-        self.data_watch.abort();
-        self.queue.abort();
-        self.policy_manager.policy_changes.abort();
-        let deadline =
-            timeout.and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
-        self.stop_tx.send_replace(deadline);
-        Ok(CtlResponse::<()>::success(
-            "successfully handled stop host".into(),
-        ))
+        let mut stop_command = StopHostCommand::builder().host_id(transport_host_id);
+        if let Some(timeout) = timeout {
+            stop_command = stop_command.timeout(timeout);
+        }
+        <Self as ControlInterfaceServer>::handle_stop_host(
+            self,
+            stop_command
+                .build()
+                .map_err(|e| anyhow!(e))
+                .context("failed to build stop host command")?,
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn handle_scale_component(
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
-        host_id: &str,
     ) -> anyhow::Result<CtlResponse<()>> {
-        let cmd = serde_json::from_slice::<ScaleComponentCommand>(payload.as_ref())
+        let request = serde_json::from_slice::<ScaleComponentCommand>(payload.as_ref())
             .context("failed to deserialize component scale command")?;
-        let component_ref = cmd.component_ref();
-        let component_id = cmd.component_id();
-        let annotations = cmd.annotations();
-        let max_instances = cmd.max_instances();
-        let config = cmd.config().clone();
-        let allow_update = cmd.allow_update();
-
-        debug!(
-            component_ref,
-            max_instances, component_id, "handling scale component"
-        );
-
-        let host_id = host_id.to_string();
-        let annotations: Annotations = annotations
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-
-        // Basic validation to ensure that the component is running and that the image reference matches
-        // If it doesn't match, we can still successfully scale, but we won't be updating the image reference
-        let (original_ref, ref_changed) = {
-            self.components
-                .read()
-                .await
-                .get(component_id)
-                .map(|v| {
-                    (
-                        Some(Arc::clone(&v.image_reference)),
-                        &*v.image_reference != component_ref,
-                    )
-                })
-                .unwrap_or_else(|| (None, false))
-        };
-
-        let mut perform_post_update: bool = false;
-        let message = match (allow_update, original_ref, ref_changed) {
-            // Updates are not allowed, original ref changed
-            (false, Some(original_ref), true) => {
-                let msg = format!(
-                    "Requested to scale existing component to a different image reference: {original_ref} != {component_ref}. The component will be scaled but the image reference will not be updated. If you meant to update this component to a new image ref, use the update command."
-                );
-                warn!(msg);
-                msg
-            }
-            // Updates are allowed, ref changed and we'll do an update later
-            (true, Some(original_ref), true) => {
-                perform_post_update = true;
-                format!(
-                    "Requested to scale existing component, with a changed image reference: {original_ref} != {component_ref}. The component will be scaled, and the image reference will be updated afterwards."
-                )
-            }
-            _ => String::with_capacity(0),
-        };
-
-        let component_id = Arc::from(component_id);
-        let component_ref = Arc::from(component_ref);
-        // Spawn a task to perform the scaling and possibly an update of the component afterwards
-        spawn(async move {
-            // Fetch the component from the reference
-            let component_and_claims =
-                self.fetch_component(&component_ref)
-                    .await
-                    .map(|component_bytes| {
-                        // Pull the claims token from the component, this returns an error only if claims are embedded
-                        // and they are invalid (expired, tampered with, etc)
-                        let claims_token =
-                            wasmcloud_runtime::component::claims_token(&component_bytes);
-                        (component_bytes, claims_token)
-                    });
-            let (wasm, claims_token) = match component_and_claims {
-                Ok((wasm, Ok(claims_token))) => (wasm, claims_token),
-                Err(e) | Ok((_, Err(e))) => {
-                    if let Err(e) = self
-                        .publish_event(
-                            "component_scale_failed",
-                            event::component_scale_failed(
-                                None,
-                                &annotations,
-                                host_id,
-                                &component_ref,
-                                &component_id,
-                                max_instances,
-                                &e,
-                            ),
-                        )
-                        .await
-                    {
-                        error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
-                    }
-                    return;
-                }
-            };
-            // Scale the component
-            if let Err(e) = self
-                .handle_scale_component_task(
-                    Arc::clone(&component_ref),
-                    Arc::clone(&component_id),
-                    &host_id,
-                    max_instances,
-                    &annotations,
-                    config,
-                    wasm,
-                    claims_token.as_ref(),
-                )
-                .await
-            {
-                error!(%component_ref, %component_id, err = ?e, "failed to scale component");
-                if let Err(e) = self
-                    .publish_event(
-                        "component_scale_failed",
-                        event::component_scale_failed(
-                            claims_token.map(|c| c.claims).as_ref(),
-                            &annotations,
-                            host_id,
-                            &component_ref,
-                            &component_id,
-                            max_instances,
-                            &e,
-                        ),
-                    )
-                    .await
-                {
-                    error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
-                }
-                return;
-            }
-
-            if perform_post_update {
-                if let Err(e) = self
-                    .handle_update_component_task(
-                        Arc::clone(&component_id),
-                        Arc::clone(&component_ref),
-                        &host_id,
-                        None,
-                    )
-                    .await
-                {
-                    error!(%component_ref, %component_id, err = ?e, "failed to update component after scale");
-                }
-            }
-        });
-
-        Ok(CtlResponse::<()>::success(message))
+        <Self as ControlInterfaceServer>::handle_scale_component(self, request).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1716,7 +1594,7 @@ impl Host {
         max_instances: u32,
         annotations: &Annotations,
         config: Vec<String>,
-        wasm: Vec<u8>,
+        wasm: anyhow::Result<Vec<u8>>,
         claims_token: Option<&jwt::Token<jwt::Component>>,
     ) -> anyhow::Result<()> {
         trace!(?component_ref, max_instances, "scale component task");
@@ -1772,28 +1650,52 @@ impl Host {
                         annotations.get("wasmcloud.dev/appspec"),
                     )
                     .await?;
+                match &wasm {
+                    Ok(wasm) => {
+                        self.start_component(
+                            entry,
+                            wasm,
+                            claims.clone(),
+                            Arc::clone(&component_ref),
+                            Arc::clone(&component_id),
+                            max,
+                            annotations,
+                            config,
+                            secrets,
+                        )
+                        .await?;
 
-                self.start_component(
-                    entry,
-                    wasm,
-                    claims.clone(),
-                    Arc::clone(&component_ref),
-                    Arc::clone(&component_id),
-                    max,
-                    annotations,
-                    config,
-                    secrets,
-                )
-                .await?;
-
-                event::component_scaled(
-                    claims.as_ref(),
-                    annotations,
-                    host_id,
-                    max,
-                    &component_ref,
-                    &component_id,
-                )
+                        event::component_scaled(
+                            claims.as_ref(),
+                            annotations,
+                            host_id,
+                            max,
+                            &component_ref,
+                            &component_id,
+                        )
+                    }
+                    Err(e) => {
+                        error!(%component_ref, %component_id, err = ?e, "failed to scale component");
+                        if let Err(e) = self
+                            .publish_event(
+                                "component_scale_failed",
+                                event::component_scale_failed(
+                                    claims_token.map(|c| c.claims.clone()).as_ref(),
+                                    annotations,
+                                    host_id,
+                                    &component_ref,
+                                    &component_id,
+                                    max_instances,
+                                    e,
+                                ),
+                            )
+                            .await
+                        {
+                            error!(%component_ref, %component_id, err = ?e, "failed to publish component scale failed event");
+                        }
+                        return Ok(());
+                    }
+                }
             }
             // Component is running and we requested to scale to zero instances, stop component
             (hash_map::Entry::Occupied(entry), None) => {
@@ -1880,65 +1782,10 @@ impl Host {
     async fn handle_update_component(
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
-        host_id: &str,
     ) -> anyhow::Result<CtlResponse<()>> {
         let cmd = serde_json::from_slice::<UpdateComponentCommand>(payload.as_ref())
             .context("failed to deserialize component update command")?;
-        let component_id = cmd.component_id();
-        let annotations = cmd.annotations().cloned();
-        let new_component_ref = cmd.new_component_ref();
-
-        debug!(
-            component_id,
-            new_component_ref,
-            ?annotations,
-            "handling update component"
-        );
-
-        // Find the component and extract the image reference
-        #[allow(clippy::map_clone)]
-        // NOTE: clippy thinks, that we can just replace the `.map` below by
-        // `.cloned` - we can't, because we need to clone the field
-        let Some(component_ref) = self
-            .components
-            .read()
-            .await
-            .get(component_id)
-            .map(|component| Arc::clone(&component.image_reference))
-        else {
-            return Ok(CtlResponse::error(&format!(
-                "component {component_id} not found"
-            )));
-        };
-
-        // If the component image reference is the same, respond with an appropriate message
-        if &*component_ref == new_component_ref {
-            return Ok(CtlResponse::<()>::success(format!(
-                "component {component_id} already updated to {new_component_ref}"
-            )));
-        }
-
-        let host_id = host_id.to_string();
-        let message = format!(
-            "component {component_id} updating from {component_ref} to {new_component_ref}"
-        );
-        let component_id = Arc::from(component_id);
-        let new_component_ref = Arc::from(new_component_ref);
-        spawn(async move {
-            if let Err(e) = self
-                .handle_update_component_task(
-                    Arc::clone(&component_id),
-                    Arc::clone(&new_component_ref),
-                    &host_id,
-                    annotations,
-                )
-                .await
-            {
-                error!(%new_component_ref, %component_id, err = ?e, "failed to update component");
-            }
-        });
-
-        Ok(CtlResponse::<()>::success(message))
+        <Self as ControlInterfaceServer>::handle_update_component(self, cmd).await
     }
 
     async fn handle_update_component_task(
@@ -2033,62 +1880,16 @@ impl Host {
     async fn handle_start_provider(
         self: Arc<Self>,
         payload: impl AsRef<[u8]>,
-        host_id: &str,
     ) -> anyhow::Result<CtlResponse<()>> {
         let cmd = serde_json::from_slice::<StartProviderCommand>(payload.as_ref())
             .context("failed to deserialize provider start command")?;
-
-        if self.providers.read().await.contains_key(cmd.provider_id()) {
-            return Ok(CtlResponse::error(
-                "provider with that ID is already running",
-            ));
-        }
-
-        // NOTE: We log at info since starting providers can take a while
-        info!(
-            provider_ref = cmd.provider_ref(),
-            provider_id = cmd.provider_id(),
-            "handling start provider"
-        );
-
-        let host_id = host_id.to_string();
-        spawn(async move {
-            let config = cmd.config();
-            let provider_id = cmd.provider_id();
-            let provider_ref = cmd.provider_ref();
-            let annotations = cmd.annotations();
-
-            if let Err(err) = self
-                .handle_start_provider_task(
-                    config,
-                    provider_id,
-                    provider_ref,
-                    annotations.cloned().unwrap_or_default(),
-                    &host_id,
-                )
-                .await
-            {
-                error!(provider_ref, provider_id, ?err, "failed to start provider");
-                if let Err(err) = self
-                    .publish_event(
-                        "provider_start_failed",
-                        event::provider_start_failed(provider_ref, provider_id, &err),
-                    )
-                    .await
-                {
-                    error!(?err, "failed to publish provider_start_failed event");
-                }
-            }
-        });
-        Ok(CtlResponse::<()>::success(
-            "successfully started provider".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_start_provider(self, cmd).await
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn handle_start_provider_task(
-        &self,
-        config: &[String],
+        self: Arc<Self>,
+        config_names: &[String],
         provider_id: &str,
         provider_ref: &str,
         annotations: BTreeMap<String, String>,
@@ -2097,14 +1898,23 @@ impl Host {
         trace!(provider_ref, provider_id, "start provider task");
 
         let registry_config = self.registry_config.read().await;
-        let (path, claims_token) = crate::fetch_provider(
-            provider_ref,
-            host_id,
-            self.host_config.allow_file_load,
-            &registry_config,
-        )
-        .await
-        .context("failed to fetch provider")?;
+        let provider_ref =
+            ResourceRef::try_from(provider_ref).context("failed to parse provider reference")?;
+        let (path, claims_token) = match &provider_ref {
+            ResourceRef::Builtin(..) => (None, None),
+            _ => {
+                let (path, claims_token) = crate::fetch_provider(
+                    &provider_ref,
+                    host_id,
+                    self.host_config.allow_file_load,
+                    &self.host_config.oci_opts.additional_ca_paths,
+                    &registry_config,
+                )
+                .await
+                .context("failed to fetch provider")?;
+                (Some(path), claims_token)
+            }
+        };
         let claims = claims_token.as_ref().map(|t| t.claims.clone());
 
         if let Some(claims) = claims.clone() {
@@ -2121,7 +1931,12 @@ impl Host {
             message,
         } = self
             .policy_manager
-            .evaluate_start_provider(provider_id, provider_ref, &annotations, claims.as_ref())
+            .evaluate_start_provider(
+                provider_id,
+                provider_ref.as_ref(),
+                &annotations,
+                claims.as_ref(),
+            )
             .await?;
         ensure!(
             permitted,
@@ -2131,373 +1946,92 @@ impl Host {
         let component_specification = self
             .get_component_spec(provider_id)
             .await?
-            .unwrap_or_else(|| ComponentSpecification::new(provider_ref));
+            .unwrap_or_else(|| ComponentSpecification::new(provider_ref.as_ref()));
 
         self.store_component_spec(&provider_id, &component_specification)
             .await?;
 
-        let (config, secrets) = self
-            .fetch_config_and_secrets(
-                config,
-                claims_token.as_ref().map(|t| &t.jwt),
-                annotations.get("wasmcloud.dev/appspec"),
-            )
-            .await?;
-
         let mut providers = self.providers.write().await;
         if let hash_map::Entry::Vacant(entry) = providers.entry(provider_id.into()) {
-            let lattice_rpc_user_seed = self
-                .host_config
-                .rpc_key
-                .as_ref()
-                .map(|key| key.seed())
-                .transpose()
-                .context("private key missing for provider RPC key")?;
-            let default_rpc_timeout_ms = Some(
-                self.host_config
-                    .rpc_timeout
-                    .as_millis()
-                    .try_into()
-                    .context("failed to convert rpc_timeout to u64")?,
-            );
-            let otel_config = OtelConfig {
-                enable_observability: self.host_config.otel_config.enable_observability,
-                enable_traces: self.host_config.otel_config.enable_traces,
-                enable_metrics: self.host_config.otel_config.enable_metrics,
-                enable_logs: self.host_config.otel_config.enable_logs,
-                observability_endpoint: self.host_config.otel_config.observability_endpoint.clone(),
-                traces_endpoint: self.host_config.otel_config.traces_endpoint.clone(),
-                metrics_endpoint: self.host_config.otel_config.metrics_endpoint.clone(),
-                logs_endpoint: self.host_config.otel_config.logs_endpoint.clone(),
-                protocol: self.host_config.otel_config.protocol,
-                additional_ca_paths: self.host_config.otel_config.additional_ca_paths.clone(),
-                trace_level: self.host_config.otel_config.trace_level.clone(),
-            };
-
             let provider_xkey = XKey::new();
-            // The provider itself needs to know its private key
-            let provider_xkey_private_key = if let Ok(seed) = provider_xkey.seed() {
-                seed
-            } else if self.host_config.secrets_topic_prefix.is_none() {
-                "".to_string()
-            } else {
-                // This should never happen since this returns an error when an Xkey is
-                // created from a public key, but if we can't generate one for whatever
-                // reason, we should bail.
-                bail!("failed to generate seed for provider xkey")
-            };
             // We only need to store the public key of the provider xkey, as the private key is only needed by the provider
             let xkey = XKey::from_public_key(&provider_xkey.public_key())
                 .context("failed to create XKey from provider public key xkey")?;
-
-            // Prepare startup links by generating the source and target configs. Note that because the provider may be the source
-            // or target of a link, we need to iterate over all links to find the ones that involve the provider.
-            let all_links = self.links.read().await;
-            let provider_links = all_links
-                .values()
-                .flatten()
-                .filter(|link| link.source_id() == provider_id || link.target() == provider_id);
-            let link_definitions = stream::iter(provider_links)
-                .filter_map(|link| async {
-                    if link.source_id() == provider_id || link.target() == provider_id {
-                        match self
-                            .resolve_link_config(
-                                link.clone(),
-                                claims_token.as_ref().map(|t| &t.jwt),
-                                annotations.get("wasmcloud.dev/appspec"),
-                                &xkey,
-                            )
-                            .await
-                        {
-                            Ok(provider_link) => Some(provider_link),
-                            Err(e) => {
-                                error!(
-                                    error = ?e,
-                                    provider_id,
-                                    source_id = link.source_id(),
-                                    target = link.target(),
-                                    "failed to resolve link config, skipping link"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
+            // Generate the HostData and ConfigBundle for the provider
+            let (host_data, config_bundle) = self
+                .prepare_provider_config(
+                    config_names,
+                    claims_token.as_ref(),
+                    provider_id,
+                    &provider_xkey,
+                    &annotations,
+                )
+                .await?;
+            let config_bundle = Arc::new(RwLock::new(config_bundle));
+            // Used by provider child tasks (health check, config watch, process restarter) to
+            // know when to shutdown.
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let tasks = match (path, &provider_ref) {
+                (Some(path), ..) => {
+                    Arc::clone(&self)
+                        .start_binary_provider(
+                            path,
+                            host_data,
+                            Arc::clone(&config_bundle),
+                            provider_xkey,
+                            provider_id,
+                            // Arguments to allow regenerating configuration later
+                            config_names.to_vec(),
+                            claims_token.clone(),
+                            annotations.clone(),
+                            shutdown.clone(),
+                        )
+                        .await?
+                }
+                (None, ResourceRef::Builtin(name)) => match *name {
+                    "http-server" if self.experimental_features.builtin_http_server => {
+                        self.start_http_server_provider(host_data, provider_xkey, provider_id)
+                            .await?
                     }
-                })
-                .collect::<Vec<wasmcloud_core::InterfaceLinkDefinition>>()
-                .await;
-
-            let secrets = {
-                // NOTE(brooksmtownsend): This trait import is used here to ensure we're only exposing secret
-                // values when we need them.
-                use secrecy::ExposeSecret;
-                secrets
-                    .iter()
-                    .map(|(k, v)| match v.expose_secret() {
-                        SecretValue::String(s) => (
-                            k.clone(),
-                            wasmcloud_core::secrets::SecretValue::String(s.to_owned()),
-                        ),
-                        SecretValue::Bytes(b) => (
-                            k.clone(),
-                            wasmcloud_core::secrets::SecretValue::Bytes(b.to_owned()),
-                        ),
-                    })
-                    .collect()
+                    "http-server" => {
+                        bail!("feature `builtin-http-server` is not enabled, denying start")
+                    }
+                    "messaging-nats" if self.experimental_features.builtin_messaging_nats => {
+                        self.start_messaging_nats_provider(host_data, provider_xkey, provider_id)
+                            .await?
+                    }
+                    "messaging-nats" => {
+                        bail!("feature `builtin-messaging-nats` is not enabled, denying start")
+                    }
+                    _ => bail!("unknown builtin name: {name}"),
+                },
+                _ => bail!("invalid provider reference"),
             };
 
-            let host_data = HostData {
-                host_id: self.host_key.public_key(),
-                lattice_rpc_prefix: self.host_config.lattice.to_string(),
-                link_name: "default".to_string(),
-                lattice_rpc_user_jwt: self.host_config.rpc_jwt.clone().unwrap_or_default(),
-                lattice_rpc_user_seed: lattice_rpc_user_seed.unwrap_or_default(),
-                lattice_rpc_url: self.host_config.rpc_nats_url.to_string(),
-                env_values: vec![],
-                instance_id: Uuid::new_v4().to_string(),
-                provider_key: provider_id.to_string(),
-                link_definitions,
-                config: config.get_config().await.clone(),
-                secrets,
-                provider_xkey_private_key,
-                host_xkey_public_key: self.secrets_xkey.public_key(),
-                cluster_issuers: vec![],
-                default_rpc_timeout_ms,
-                log_level: Some(self.host_config.log_level.clone()),
-                structured_logging: self.host_config.enable_structured_logging,
-                otel_config,
-            };
-            let host_data =
-                serde_json::to_vec(&host_data).context("failed to serialize provider data")?;
-
-            trace!("spawn provider process");
-
-            let mut child_cmd = process::Command::new(&path);
-            // Prevent the provider from inheriting the host's environment, with the exception of
-            // the following variables we manually add back
-            child_cmd.env_clear();
-
-            if cfg!(windows) {
-                // Proxy SYSTEMROOT to providers. Without this, providers on Windows won't be able to start
-                child_cmd.env(
-                    "SYSTEMROOT",
-                    env::var("SYSTEMROOT")
-                        .context("SYSTEMROOT is not set. Providers cannot be started")?,
-                );
-            }
-
-            // Proxy RUST_LOG to (Rust) providers, so they can use the same module-level directives
-            if let Ok(rust_log) = env::var("RUST_LOG") {
-                let _ = child_cmd.env("RUST_LOG", rust_log);
-            }
-
-            let mut child = child_cmd
-                .stdin(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("failed to spawn provider process")?;
-            let mut stdin = child.stdin.take().context("failed to take stdin")?;
-            stdin
-                .write_all(STANDARD.encode(&host_data).as_bytes())
-                .await
-                .context("failed to write provider data")?;
-            stdin
-                .write_all(b"\r\n")
-                .await
-                .context("failed to write newline")?;
-            stdin.shutdown().await.context("failed to close stdin")?;
-
-            // Create a channel for watching for child process exit
-            let (exit_tx, exit_rx) = broadcast::channel::<()>(1);
-            spawn(async move {
-                match child.wait().await {
-                    Ok(status) => {
-                        debug!("provider @ [{}] exited with `{status:?}`", path.display());
-                    }
-                    Err(e) => {
-                        error!(
-                            "failed to wait for provider @ [{}] to execute: {e}",
-                            path.display()
-                        );
-                    }
-                }
-                if let Err(err) = exit_tx.send(()) {
-                    warn!(%err, "failed to send exit tx");
-                }
-            });
-            let mut exit_health_rx = exit_rx.resubscribe();
-
-            // TODO: Change method receiver to Arc<Self> and `move` into the closure
-            let rpc_nats = self.rpc_nats.clone();
-            let ctl_nats = self.ctl_nats.clone();
-            let event_builder = self.event_builder.clone();
-            // NOTE: health_ prefix here is to allow us to move the variables into the closure
-            let health_lattice = self.host_config.lattice.clone();
-            let health_host_id = host_id.to_string();
-            let health_provider_id = provider_id.to_string();
-            let health_check_task = spawn(async move {
-                // Check the health of the provider every 30 seconds
-                let mut health_check = tokio::time::interval(Duration::from_secs(30));
-                let mut previous_healthy = false;
-                // Allow the provider 5 seconds to initialize
-                health_check.reset_after(Duration::from_secs(5));
-                let health_topic =
-                    format!("wasmbus.rpc.{health_lattice}.{health_provider_id}.health");
-                // TODO: Refactor this logic to simplify nesting
-                loop {
-                    select! {
-                        _ = health_check.tick() => {
-                            trace!(provider_id=health_provider_id, "performing provider health check");
-                            let request = async_nats::Request::new()
-                                .payload(Bytes::new())
-                                .headers(injector_to_headers(&TraceContextInjector::default_with_span()));
-                            if let Ok(async_nats::Message { payload, ..}) = rpc_nats.send_request(
-                                health_topic.clone(),
-                                request,
-                                ).await {
-                                    match (serde_json::from_slice::<HealthCheckResponse>(&payload), previous_healthy) {
-                                        (Ok(HealthCheckResponse { healthy: true, ..}), false) => {
-                                            trace!(provider_id=health_provider_id, "provider health check succeeded");
-                                            previous_healthy = true;
-                                            if let Err(e) = event::publish(
-                                                &event_builder,
-                                                &ctl_nats,
-                                                &health_lattice,
-                                                "health_check_passed",
-                                                event::provider_health_check(
-                                                    &health_host_id,
-                                                    &health_provider_id,
-                                                )
-                                            ).await {
-                                                warn!(
-                                                    ?e,
-                                                    provider_id = health_provider_id,
-                                                    "failed to publish provider health check succeeded event",
-                                                );
-                                            }
-                                        },
-                                        (Ok(HealthCheckResponse { healthy: false, ..}), true) => {
-                                            trace!(provider_id=health_provider_id, "provider health check failed");
-                                            previous_healthy = false;
-                                            if let Err(e) = event::publish(
-                                                &event_builder,
-                                                &ctl_nats,
-                                                &health_lattice,
-                                                "health_check_failed",
-                                                event::provider_health_check(
-                                                    &health_host_id,
-                                                    &health_provider_id,
-                                                )
-                                            ).await {
-                                                warn!(
-                                                    ?e,
-                                                    provider_id = health_provider_id,
-                                                    "failed to publish provider health check failed event",
-                                                );
-                                            }
-                                        }
-                                        // If the provider health status didn't change, we simply publish a health check status event
-                                        (Ok(_), _) => {
-                                            if let Err(e) = event::publish(
-                                                &event_builder,
-                                                &ctl_nats,
-                                                &health_lattice,
-                                                "health_check_status",
-                                                event::provider_health_check(
-                                                    &health_host_id,
-                                                    &health_provider_id,
-                                                )
-                                            ).await {
-                                                warn!(
-                                                    ?e,
-                                                    provider_id = health_provider_id,
-                                                    "failed to publish provider health check status event",
-                                                );
-                                            }
-                                        },
-                                        _ => warn!(
-                                            provider_id = health_provider_id,
-                                            "failed to deserialize provider health check response"
-                                        ),
-                                    }
-                                }
-                                else {
-                                    warn!(provider_id = health_provider_id, "failed to request provider health, retrying in 30 seconds");
-                                }
-                        }
-                        exit = exit_health_rx.recv() => {
-                            if let Err(err) = exit {
-                                warn!(%err, provider_id = health_provider_id, "failed to receive exit in health check task");
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-            info!(provider_ref, provider_id, "provider started");
+            info!(
+                provider_ref = provider_ref.as_ref(),
+                provider_id, "provider started"
+            );
             self.publish_event(
                 "provider_started",
                 event::provider_started(
                     claims.as_ref(),
                     &annotations,
                     host_id,
-                    provider_ref,
+                    &provider_ref,
                     provider_id,
                 ),
             )
             .await?;
 
-            // Spawn off a task to watch for config bundle updates and forward them to
-            // the provider that we're spawning and managing
-            let mut exit_config_tx = exit_rx;
-            let provider_id = provider_id.to_string();
-            let lattice = self.host_config.lattice.to_string();
-            let client = self.rpc_nats.clone();
-            let config = Arc::new(RwLock::new(config));
-            let update_config = config.clone();
-            let config_update_task = spawn(async move {
-                let subject = provider_config_update_subject(&lattice, &provider_id);
-                trace!(provider_id, "starting config update listener");
-                loop {
-                    let mut update_config = update_config.write().await;
-                    select! {
-                        maybe_update = update_config.changed() => {
-                            let Ok(update) = maybe_update else {
-                                break;
-                            };
-                            trace!(provider_id, "provider config bundle changed");
-                            let bytes = match serde_json::to_vec(&*update) {
-                                Ok(bytes) => bytes,
-                                Err(err) => {
-                                    error!(%err, provider_id, lattice, "failed to serialize configuration update ");
-                                    continue;
-                                }
-                            };
-                            trace!(provider_id, subject, "publishing config bundle bytes");
-                            if let Err(err) = client.publish(subject.clone(), Bytes::from(bytes)).await {
-                                error!(%err, provider_id, lattice, "failed to publish configuration update bytes to component");
-                            }
-                        }
-                        exit = exit_config_tx.recv() => {
-                            if let Err(err) = exit {
-                                warn!(%err, provider_id, "failed to receive exit in config update task");
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-
             // Add the provider
             entry.insert(Provider {
-                health_check_task,
-                config_update_task,
+                tasks,
                 annotations,
                 claims_token,
-                image_ref: provider_ref.to_string(),
+                image_ref: provider_ref.as_ref().to_string(),
                 xkey,
-                config,
+                shutdown,
             });
         } else {
             bail!("provider is already running with that ID")
@@ -2510,112 +2044,30 @@ impl Host {
     async fn handle_stop_provider(
         &self,
         payload: impl AsRef<[u8]>,
-        host_id: &str,
     ) -> anyhow::Result<CtlResponse<()>> {
         let cmd = serde_json::from_slice::<StopProviderCommand>(payload.as_ref())
             .context("failed to deserialize provider stop command")?;
-        let provider_id = cmd.provider_id();
-
-        debug!(provider_id, "handling stop provider");
-
-        let mut providers = self.providers.write().await;
-        let hash_map::Entry::Occupied(entry) = providers.entry(provider_id.into()) else {
-            warn!(
-                provider_id,
-                "received request to stop provider that is not running"
-            );
-            return Ok(CtlResponse::error("provider with that ID is not running"));
-        };
-        let Provider {
-            ref annotations, ..
-        } = entry.remove();
-
-        // Send a request to the provider, requesting a graceful shutdown
-        let req = serde_json::to_vec(&json!({ "host_id": host_id }))
-            .context("failed to encode provider stop request")?;
-        let req = async_nats::Request::new()
-            .payload(req.into())
-            .timeout(self.host_config.provider_shutdown_delay)
-            .headers(injector_to_headers(
-                &TraceContextInjector::default_with_span(),
-            ));
-        if let Err(e) = self
-            .rpc_nats
-            .send_request(
-                format!(
-                    "wasmbus.rpc.{}.{provider_id}.default.shutdown",
-                    self.host_config.lattice
-                ),
-                req,
-            )
-            .await
-        {
-            warn!(
-                ?e,
-                provider_id,
-                "provider did not gracefully shut down in time, shutting down forcefully"
-            );
-        }
-        info!(provider_id, "provider stopped");
-        self.publish_event(
-            "provider_stopped",
-            event::provider_stopped(annotations, host_id, provider_id, "stop"),
-        )
-        .await?;
-        Ok(CtlResponse::<()>::success(
-            "successfully stopped provider".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_stop_provider(self, cmd).await
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn handle_inventory(&self) -> anyhow::Result<CtlResponse<HostInventory>> {
-        trace!("handling inventory");
-        let inventory = self.inventory().await;
-        Ok(CtlResponse::ok(inventory))
+        <Self as ControlInterfaceServer>::handle_inventory(self).await
     }
 
     #[instrument(level = "trace", skip_all)]
     async fn handle_claims(&self) -> anyhow::Result<CtlResponse<Vec<HashMap<String, String>>>> {
-        trace!("handling claims");
-
-        let (component_claims, provider_claims) =
-            join!(self.component_claims.read(), self.provider_claims.read());
-        let component_claims = component_claims.values().cloned().map(Claims::Component);
-        let provider_claims = provider_claims.values().cloned().map(Claims::Provider);
-        let claims: Vec<StoredClaims> = component_claims
-            .chain(provider_claims)
-            .flat_map(TryFrom::try_from)
-            .collect();
-
-        Ok(CtlResponse::ok(
-            claims.into_iter().map(std::convert::Into::into).collect(),
-        ))
+        <Self as ControlInterfaceServer>::handle_claims(self).await
     }
 
     #[instrument(level = "trace", skip_all)]
     async fn handle_links(&self) -> anyhow::Result<Vec<u8>> {
-        trace!("handling links");
-
-        let links = self.links.read().await;
-        let links: Vec<&Link> = links.values().flatten().collect();
-        let res =
-            serde_json::to_vec(&CtlResponse::ok(links)).context("failed to serialize response")?;
-        Ok(res)
+        <Self as ControlInterfaceServer>::handle_links(self).await
     }
 
     #[instrument(level = "trace", skip(self))]
     async fn handle_config_get(&self, config_name: &str) -> anyhow::Result<Vec<u8>> {
-        trace!(%config_name, "handling get config");
-        if let Some(config_bytes) = self.config_data.get(config_name).await? {
-            let config_map: HashMap<String, String> = serde_json::from_slice(&config_bytes)
-                .context("config data should be a map of string -> string")?;
-            serde_json::to_vec(&CtlResponse::ok(config_map)).map_err(anyhow::Error::from)
-        } else {
-            serde_json::to_vec(&CtlResponse::<()>::success(
-                "Configuration not found".into(),
-            ))
-            .map_err(anyhow::Error::from)
-        }
+        <Self as ControlInterfaceServer>::handle_config_get(self, config_name).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2626,28 +2078,7 @@ impl Host {
     ) -> anyhow::Result<CtlResponse<()>> {
         let host_label = serde_json::from_slice::<HostLabel>(payload.as_ref())
             .context("failed to deserialize put label request")?;
-        let key = host_label.key();
-        let value = host_label.value();
-        let mut labels = self.labels.write().await;
-        match labels.entry(key.into()) {
-            BTreeMapEntry::Occupied(mut entry) => {
-                info!(key = entry.key(), value, "updated label");
-                entry.insert(value.into());
-            }
-            BTreeMapEntry::Vacant(entry) => {
-                info!(key = entry.key(), value, "set label");
-                entry.insert(value.into());
-            }
-        }
-
-        self.publish_event(
-            "labels_changed",
-            event::labels_changed(host_id, HashMap::from_iter(labels.clone())),
-        )
-        .await
-        .context("failed to publish labels_changed event")?;
-
-        Ok(CtlResponse::<()>::success("successfully put label".into()))
+        <Self as ControlInterfaceServer>::handle_label_put(self, host_label, host_id).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2656,204 +2087,27 @@ impl Host {
         host_id: &str,
         payload: impl AsRef<[u8]>,
     ) -> anyhow::Result<CtlResponse<()>> {
-        let label = serde_json::from_slice::<HostLabel>(payload.as_ref())
+        let label = serde_json::from_slice::<HostLabelIdentifier>(payload.as_ref())
             .context("failed to deserialize delete label request")?;
-        let key = label.key();
-        let mut labels = self.labels.write().await;
-        let value = labels.remove(key);
-
-        if value.is_none() {
-            warn!(key, "could not remove unset label");
-            return Ok(CtlResponse::<()>::success(
-                "successfully deleted label (no such label)".into(),
-            ));
-        };
-
-        info!(key, "removed label");
-        self.publish_event(
-            "labels_changed",
-            event::labels_changed(host_id, HashMap::from_iter(labels.clone())),
-        )
-        .await
-        .context("failed to publish labels_changed event")?;
-
-        Ok(CtlResponse::<()>::success(
-            "successfully deleted label".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_label_del(self, label, host_id).await
     }
 
-    /// Handle a new link by modifying the relevant source [ComponentSpeficication]. Once
+    /// Handle a new link by modifying the relevant source [ComponentSpecification]. Once
     /// the change is written to the LATTICEDATA store, each host in the lattice (including this one)
     /// will handle the new specification and update their own internal link maps via [process_component_spec_put].
     #[instrument(level = "debug", skip_all)]
     async fn handle_link_put(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<CtlResponse<()>> {
-        let payload = payload.as_ref();
-        let link: Link = serde_json::from_slice(payload)
+        let link: Link = serde_json::from_slice(payload.as_ref())
             .context("failed to deserialize wrpc link definition")?;
-
-        let link_set_result: anyhow::Result<()> = async {
-            let source_id = link.source_id();
-            let target = link.target();
-            let wit_namespace = link.wit_namespace();
-            let wit_package = link.wit_package();
-            let interfaces = link.interfaces();
-            let name = link.name();
-
-            let ns_and_package = format!("{wit_namespace}:{wit_package}");
-            debug!(
-                source_id,
-                target,
-                ns_and_package,
-                name,
-                ?interfaces,
-                "handling put wrpc link definition"
-            );
-
-            // Validate all configurations
-            self.validate_config(
-                link
-                    .source_config()
-                    .clone()
-                    .iter()
-                    .chain(link.target_config())
-            ).await?;
-
-            let mut component_spec = self
-                .get_component_spec(source_id)
-                .await?
-                .unwrap_or_default();
-
-            // If the link is defined from this source on the same interface and link name, but to a different target,
-            // we need to reject this link and suggest deleting the existing link or using a different link name.
-            if let Some(existing_conflict_link) = component_spec.links.iter().find(|link| {
-                link.source_id() == source_id
-                    && link.wit_namespace() == wit_namespace
-                    && link.wit_package() == wit_package
-                    && link.name() == name
-                    && link.target() != target
-            }) {
-                error!(
-                    source_id,
-                    desired_target = target,
-                    existing_target = existing_conflict_link.target(),
-                    ns_and_package,
-                    name,
-                    "link already exists with different target, consider deleting the existing link or using a different link name"
-                );
-                bail!("link already exists with different target, consider deleting the existing link or using a different link name");
-            }
-
-            // If we can find an existing link with the same source, target, namespace, package, and name, update it.
-            // Otherwise, add the new link to the component specification.
-            if let Some(existing_link_index) = component_spec.links.iter().position(|link| {
-                link.source_id() == source_id
-                    && link.target() == target
-                    && link.wit_namespace() == wit_namespace
-                    && link.wit_package() == wit_package
-                    && link.name() == name
-            }) {
-                if let Some(existing_link) = component_spec.links.get_mut(existing_link_index) {
-                    *existing_link = link.clone();
-                }
-            } else {
-                component_spec.links.push(link.clone());
-            };
-
-            // Update component specification with the new link
-            self.store_component_spec(&source_id, &component_spec)
-                .await?;
-
-            self.put_backwards_compat_provider_link(&link)
-                .await?;
-
-            Ok(())
-        }
-        .await;
-
-        if let Err(e) = link_set_result {
-            self.publish_event("linkdef_set_failed", event::linkdef_set_failed(&link, &e))
-                .await?;
-            Ok(CtlResponse::error(e.to_string().as_ref()))
-        } else {
-            self.publish_event("linkdef_set", event::linkdef_set(&link))
-                .await?;
-            Ok(CtlResponse::<()>::success("successfully set link".into()))
-        }
+        <Self as ControlInterfaceServer>::handle_link_put(self, link).await
     }
 
     #[instrument(level = "debug", skip_all)]
     /// Remove an interface link on a source component for a specific package
     async fn handle_link_del(&self, payload: impl AsRef<[u8]>) -> anyhow::Result<CtlResponse<()>> {
-        let payload = payload.as_ref();
-        let req = serde_json::from_slice::<DeleteInterfaceLinkDefinitionRequest>(payload)
+        let req = serde_json::from_slice::<DeleteInterfaceLinkDefinitionRequest>(payload.as_ref())
             .context("failed to deserialize wrpc link definition")?;
-        let source_id = req.source_id();
-        let wit_namespace = req.wit_namespace();
-        let wit_package = req.wit_package();
-        let link_name = req.link_name();
-
-        let ns_and_package = format!("{wit_namespace}:{wit_package}");
-
-        debug!(
-            source_id,
-            ns_and_package, link_name, "handling del wrpc link definition"
-        );
-
-        let Some(mut component_spec) = self.get_component_spec(source_id).await? else {
-            // If the component spec doesn't exist, the link is deleted
-            return Ok(CtlResponse::<()>::success(
-                "successfully deleted link (spec doesn't exist)".into(),
-            ));
-        };
-
-        // If we can find an existing link with the same source, namespace, package, and name, remove it
-        // and update the component specification.
-        let deleted_link = if let Some(existing_link_index) =
-            component_spec.links.iter().position(|link| {
-                link.source_id() == source_id
-                    && link.wit_namespace() == wit_namespace
-                    && link.wit_package() == wit_package
-                    && link.name() == link_name
-            }) {
-            // Sanity safety check since `swap_remove` will panic if the index is out of bounds
-            if existing_link_index < component_spec.links.len() {
-                Some(component_spec.links.swap_remove(existing_link_index))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(link) = deleted_link.as_ref() {
-            // Update component specification with the deleted link
-            self.store_component_spec(&source_id, &component_spec)
-                .await?;
-
-            // Send the link to providers for deletion
-            self.del_provider_link(link).await?;
-        }
-
-        // For idempotency, we always publish the deleted event, even if the link didn't exist
-        let deleted_link_target = deleted_link
-            .as_ref()
-            .map(|link| String::from(link.target()));
-        self.publish_event(
-            "linkdef_deleted",
-            event::linkdef_deleted(
-                source_id,
-                deleted_link_target.as_ref(),
-                link_name,
-                wit_namespace,
-                wit_package,
-                deleted_link.as_ref().map(|link| link.interfaces()),
-            ),
-        )
-        .await?;
-
-        Ok(CtlResponse::<()>::success(
-            "successfully deleted link".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_link_del(self, req).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2864,29 +2118,7 @@ impl Host {
         let registry_creds: HashMap<String, RegistryCredential> =
             serde_json::from_slice(payload.as_ref())
                 .context("failed to deserialize registries put command")?;
-
-        info!(
-            registries = ?registry_creds.keys(),
-            "updating registry config",
-        );
-
-        let mut registry_config = self.registry_config.write().await;
-        for (reg, new_creds) in registry_creds {
-            let mut new_config = new_creds.into_registry_config()?;
-            match registry_config.entry(reg) {
-                hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().set_auth(new_config.auth().clone());
-                }
-                hash_map::Entry::Vacant(entry) => {
-                    new_config.set_allow_latest(self.host_config.oci_opts.allow_latest);
-                    entry.insert(new_config);
-                }
-            }
-        }
-
-        Ok(CtlResponse::<()>::success(
-            "successfully put registries".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_registries_put(self, registry_creds).await
     }
 
     #[instrument(level = "debug", skip_all, fields(%config_name))]
@@ -2895,67 +2127,22 @@ impl Host {
         config_name: &str,
         data: Bytes,
     ) -> anyhow::Result<CtlResponse<()>> {
-        debug!("handle config entry put");
         // Validate that the data is of the proper type by deserialing it
         serde_json::from_slice::<HashMap<String, String>>(&data)
             .context("config data should be a map of string -> string")?;
-        self.config_data
-            .put(config_name, data)
-            .await
-            .context("unable to store config data")?;
-        // We don't write it into the cached data and instead let the caching thread handle it as we
-        // won't need it immediately.
-        self.publish_event("config_set", event::config_set(config_name))
-            .await?;
-
-        Ok(CtlResponse::<()>::success("successfully put config".into()))
+        <Self as ControlInterfaceServer>::handle_config_put(self, config_name, data).await
     }
 
     #[instrument(level = "debug", skip_all, fields(%config_name))]
     async fn handle_config_delete(&self, config_name: &str) -> anyhow::Result<CtlResponse<()>> {
-        debug!("handle config entry deletion");
-
-        self.config_data
-            .purge(config_name)
-            .await
-            .context("Unable to delete config data")?;
-
-        self.publish_event("config_deleted", event::config_deleted(config_name))
-            .await?;
-
-        Ok(CtlResponse::<()>::success(
-            "successfully deleted config".into(),
-        ))
+        <Self as ControlInterfaceServer>::handle_config_delete(self, config_name).await
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn handle_ping_hosts(
         &self,
-        _payload: impl AsRef<[u8]>,
     ) -> anyhow::Result<CtlResponse<wasmcloud_control_interface::Host>> {
-        trace!("replying to ping");
-        let uptime = self.start_at.elapsed();
-
-        let mut host = wasmcloud_control_interface::Host::builder()
-            .id(self.host_key.public_key())
-            .labels(self.labels.read().await.clone())
-            .friendly_name(self.friendly_name.clone())
-            .uptime_seconds(uptime.as_secs())
-            .uptime_human(human_friendly_uptime(uptime))
-            .version(self.host_config.version.clone())
-            .ctl_host(self.host_config.ctl_nats_url.to_string())
-            .rpc_host(self.host_config.rpc_nats_url.to_string())
-            .lattice(self.host_config.lattice.to_string());
-
-        if let Some(ref js_domain) = self.host_config.js_domain {
-            host = host.js_domain(js_domain.clone());
-        }
-
-        let host = host
-            .build()
-            .map_err(|e| anyhow!("failed to build host message: {e}"))?;
-
-        Ok(CtlResponse::ok(host))
+        <Self as ControlInterfaceServer>::handle_ping_hosts(self).await
     }
 
     #[instrument(level = "trace", skip_all, fields(subject = %message.subject))]
@@ -2989,13 +2176,13 @@ impl Host {
                 .handle_auction_component(message.payload)
                 .await
                 .map(serialize_ctl_response),
-            (Some("component"), Some("scale"), Some(host_id), None) => Arc::clone(&self)
-                .handle_scale_component(message.payload, host_id)
+            (Some("component"), Some("scale"), Some(_host_id), None) => Arc::clone(&self)
+                .handle_scale_component(message.payload)
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            (Some("component"), Some("update"), Some(host_id), None) => Arc::clone(&self)
-                .handle_update_component(message.payload, host_id)
+            (Some("component"), Some("update"), Some(_host_id), None) => Arc::clone(&self)
+                .handle_update_component(message.payload)
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
@@ -3004,13 +2191,13 @@ impl Host {
                 .handle_auction_provider(message.payload)
                 .await
                 .map(serialize_ctl_response),
-            (Some("provider"), Some("start"), Some(host_id), None) => Arc::clone(&self)
-                .handle_start_provider(message.payload, host_id)
+            (Some("provider"), Some("start"), Some(_host_id), None) => Arc::clone(&self)
+                .handle_start_provider(message.payload)
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
-            (Some("provider"), Some("stop"), Some(host_id), None) => self
-                .handle_stop_provider(message.payload, host_id)
+            (Some("provider"), Some("stop"), Some(_host_id), None) => self
+                .handle_stop_provider(message.payload)
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
@@ -3021,7 +2208,7 @@ impl Host {
                 .map(Some)
                 .map(serialize_ctl_response),
             (Some("host"), Some("ping"), None, None) => self
-                .handle_ping_hosts(message.payload)
+                .handle_ping_hosts()
                 .await
                 .map(Some)
                 .map(serialize_ctl_response),
@@ -3273,270 +2460,12 @@ impl Host {
             .context("failed to publish provider link definition delete")
     }
 
-    /// Retrieve a component specification based on the provided ID. The outer Result is for errors
-    /// accessing the store, and the inner option indicates if the spec exists.
-    #[instrument(level = "debug", skip_all)]
-    async fn get_component_spec(&self, id: &str) -> anyhow::Result<Option<ComponentSpecification>> {
-        let key = format!("COMPONENT_{id}");
-        let spec = self
-            .data
-            .get(key)
-            .await
-            .context("failed to get component spec")?
-            .map(|spec_bytes| serde_json::from_slice(&spec_bytes))
-            .transpose()
-            .context(format!(
-                "failed to deserialize stored component specification for {id}"
-            ))?;
-        Ok(spec)
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn store_component_spec(
-        &self,
-        id: impl AsRef<str>,
-        spec: &ComponentSpecification,
-    ) -> anyhow::Result<()> {
-        let id = id.as_ref();
-        let key = format!("COMPONENT_{id}");
-        let bytes = serde_json::to_vec(spec)
-            .context("failed to serialize component spec")?
-            .into();
-        self.data
-            .put(key, bytes)
-            .await
-            .context("failed to put component spec")?;
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn store_claims(&self, claims: Claims) -> anyhow::Result<()> {
-        match &claims {
-            Claims::Component(claims) => {
-                self.store_component_claims(claims.clone()).await?;
-            }
-            Claims::Provider(claims) => {
-                let mut provider_claims = self.provider_claims.write().await;
-                provider_claims.insert(claims.subject.clone(), claims.clone());
-            }
-        };
-        let claims: StoredClaims = claims.try_into()?;
-        let subject = match &claims {
-            StoredClaims::Component(claims) => &claims.subject,
-            StoredClaims::Provider(claims) => &claims.subject,
-        };
-        let key = format!("CLAIMS_{subject}");
-        trace!(?claims, ?key, "storing claims");
-
-        let bytes = serde_json::to_vec(&claims)
-            .context("failed to serialize claims")?
-            .into();
-        self.data
-            .put(key, bytes)
-            .await
-            .context("failed to put claims")?;
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn process_component_spec_put(
-        &self,
-        id: impl AsRef<str>,
-        value: impl AsRef<[u8]>,
-        _publish: bool,
-    ) -> anyhow::Result<()> {
-        let id = id.as_ref();
-        debug!(id, "process component spec put");
-
-        let spec: ComponentSpecification = serde_json::from_slice(value.as_ref())
-            .context("failed to deserialize component specification")?;
-
-        // Compute all new links that do not exist in the host map, which we'll use to
-        // publish to any running providers that are the source or target of the link.
-        // Computing this ahead of time is a tradeoff to hold only one lock at the cost of
-        // allocating an extra Vec. This may be a good place to optimize allocations.
-        let new_links = {
-            let all_links = self.links.read().await;
-            spec.links
-                .iter()
-                .filter(|spec_link| {
-                    // Retain only links that do not exist in the host map
-                    !all_links
-                        .iter()
-                        .filter_map(|(source_id, links)| {
-                            // Only consider links that are either the source or target of the new link
-                            if source_id == spec_link.source_id() || source_id == spec_link.target()
-                            {
-                                Some(links)
-                            } else {
-                                None
-                            }
-                        })
-                        .flatten()
-                        .any(|host_link| *spec_link == host_link)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        {
-            // Acquire lock once in this block to avoid continually trying to acquire it.
-            let providers = self.providers.read().await;
-            // For every new link, if a provider is running on this host as the source or target,
-            // send the link to the provider for handling based on the xkey public key.
-            for link in new_links {
-                if let Some(provider) = providers.get(link.source_id()) {
-                    if let Err(e) = self.put_provider_link(provider, link).await {
-                        error!(?e, "failed to put provider link");
-                    }
-                }
-                if let Some(provider) = providers.get(link.target()) {
-                    if let Err(e) = self.put_provider_link(provider, link).await {
-                        error!(?e, "failed to put provider link");
-                    }
-                }
-            }
-        }
-
-        // If the component is already running, update the links
-        if let Some(component) = self.components.write().await.get(id) {
-            *component.handler.instance_links.write().await = component_import_links(&spec.links);
-            // NOTE(brooksmtownsend): We can consider updating the component if the image URL changes
-        };
-
-        // Insert the links into host map
-        self.links.write().await.insert(id.to_string(), spec.links);
-
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn process_component_spec_delete(
-        &self,
-        id: impl AsRef<str>,
-        _value: impl AsRef<[u8]>,
-        _publish: bool,
-    ) -> anyhow::Result<()> {
-        let id = id.as_ref();
-        debug!(id, "process component delete");
-        // TODO: TBD: stop component if spec deleted?
-        if self.components.write().await.get(id).is_some() {
-            warn!(
-                component_id = id,
-                "component spec deleted, but component is still running"
-            );
-        }
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn process_claims_put(
-        &self,
-        pubkey: impl AsRef<str>,
-        value: impl AsRef<[u8]>,
-    ) -> anyhow::Result<()> {
-        let pubkey = pubkey.as_ref();
-
-        debug!(pubkey, "process claim entry put");
-
-        let stored_claims: StoredClaims =
-            serde_json::from_slice(value.as_ref()).context("failed to decode stored claims")?;
-        let claims = Claims::from(stored_claims);
-
-        ensure!(claims.subject() == pubkey, "subject mismatch");
-        match claims {
-            Claims::Component(claims) => self.store_component_claims(claims).await,
-            Claims::Provider(claims) => {
-                let mut provider_claims = self.provider_claims.write().await;
-                provider_claims.insert(claims.subject.clone(), claims);
-                Ok(())
-            }
-        }
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn process_claims_delete(
-        &self,
-        pubkey: impl AsRef<str>,
-        value: impl AsRef<[u8]>,
-    ) -> anyhow::Result<()> {
-        let pubkey = pubkey.as_ref();
-
-        debug!(pubkey, "process claim entry deletion");
-
-        let stored_claims: StoredClaims =
-            serde_json::from_slice(value.as_ref()).context("failed to decode stored claims")?;
-        let claims = Claims::from(stored_claims);
-
-        ensure!(claims.subject() == pubkey, "subject mismatch");
-
-        match claims {
-            Claims::Component(claims) => {
-                let mut component_claims = self.component_claims.write().await;
-                component_claims.remove(&claims.subject);
-            }
-            Claims::Provider(claims) => {
-                let mut provider_claims = self.provider_claims.write().await;
-                provider_claims.remove(&claims.subject);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[instrument(level = "trace", skip_all)]
-    async fn process_entry(
-        &self,
-        KvEntry {
-            key,
-            value,
-            operation,
-            ..
-        }: KvEntry,
-        publish: bool,
-    ) {
-        let key_id = key.split_once('_');
-        let res = match (operation, key_id) {
-            (Operation::Put, Some(("COMPONENT", id))) => {
-                self.process_component_spec_put(id, value, publish).await
-            }
-            (Operation::Delete, Some(("COMPONENT", id))) => {
-                self.process_component_spec_delete(id, value, publish).await
-            }
-            (Operation::Put, Some(("LINKDEF", _id))) => {
-                debug!("ignoring deprecated LINKDEF put operation");
-                Ok(())
-            }
-            (Operation::Delete, Some(("LINKDEF", _id))) => {
-                debug!("ignoring deprecated LINKDEF delete operation");
-                Ok(())
-            }
-            (Operation::Put, Some(("CLAIMS", pubkey))) => {
-                self.process_claims_put(pubkey, value).await
-            }
-            (Operation::Delete, Some(("CLAIMS", pubkey))) => {
-                self.process_claims_delete(pubkey, value).await
-            }
-            (operation, Some(("REFMAP", id))) => {
-                // TODO: process REFMAP entries
-                debug!(?operation, id, "ignoring REFMAP entry");
-                Ok(())
-            }
-            _ => {
-                warn!(key, ?operation, "unsupported KV bucket entry");
-                Ok(())
-            }
-        };
-        if let Err(error) = &res {
-            error!(key, ?operation, ?error, "failed to process KV bucket entry");
-        }
-    }
-
     async fn fetch_config_and_secrets(
         &self,
         config_names: &[String],
         entity_jwt: Option<&String>,
         application: Option<&String>,
-    ) -> anyhow::Result<(ConfigBundle, HashMap<String, Secret<SecretValue>>)> {
+    ) -> anyhow::Result<(ConfigBundle, HashMap<String, SecretBox<SecretValue>>)> {
         let (secret_names, config_names) = config_names
             .iter()
             .map(|s| s.to_string())
@@ -3720,240 +2649,6 @@ fn serialize_ctl_response<T: Serialize>(
     ctl_response: Option<CtlResponse<T>>,
 ) -> Option<anyhow::Result<Vec<u8>>> {
     ctl_response.map(|resp| serde_json::to_vec(&resp).map_err(anyhow::Error::from))
-}
-
-// TODO: remove StoredClaims in #1093
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum StoredClaims {
-    Component(StoredComponentClaims),
-    Provider(StoredProviderClaims),
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct StoredComponentClaims {
-    call_alias: String,
-    #[serde(alias = "iss")]
-    issuer: String,
-    name: String,
-    #[serde(alias = "rev")]
-    revision: String,
-    #[serde(alias = "sub")]
-    subject: String,
-    #[serde(deserialize_with = "deserialize_messy_vec")]
-    tags: Vec<String>,
-    version: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct StoredProviderClaims {
-    #[serde(alias = "iss")]
-    issuer: String,
-    name: String,
-    #[serde(alias = "rev")]
-    revision: String,
-    #[serde(alias = "sub")]
-    subject: String,
-    version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    config_schema: Option<String>,
-}
-
-impl TryFrom<Claims> for StoredClaims {
-    type Error = anyhow::Error;
-
-    fn try_from(claims: Claims) -> Result<Self, Self::Error> {
-        match claims {
-            Claims::Component(jwt::Claims {
-                issuer,
-                subject,
-                metadata,
-                ..
-            }) => {
-                let jwt::Component {
-                    name,
-                    tags,
-                    rev,
-                    ver,
-                    call_alias,
-                    ..
-                } = metadata.context("no metadata found on component claims")?;
-                Ok(StoredClaims::Component(StoredComponentClaims {
-                    call_alias: call_alias.unwrap_or_default(),
-                    issuer,
-                    name: name.unwrap_or_default(),
-                    revision: rev.unwrap_or_default().to_string(),
-                    subject,
-                    tags: tags.unwrap_or_default(),
-                    version: ver.unwrap_or_default(),
-                }))
-            }
-            Claims::Provider(jwt::Claims {
-                issuer,
-                subject,
-                metadata,
-                ..
-            }) => {
-                let jwt::CapabilityProvider {
-                    name,
-                    rev,
-                    ver,
-                    config_schema,
-                    ..
-                } = metadata.context("no metadata found on provider claims")?;
-                Ok(StoredClaims::Provider(StoredProviderClaims {
-                    issuer,
-                    name: name.unwrap_or_default(),
-                    revision: rev.unwrap_or_default().to_string(),
-                    subject,
-                    version: ver.unwrap_or_default(),
-                    config_schema: config_schema.map(|schema| schema.to_string()),
-                }))
-            }
-        }
-    }
-}
-
-impl TryFrom<&Claims> for StoredClaims {
-    type Error = anyhow::Error;
-
-    fn try_from(claims: &Claims) -> Result<Self, Self::Error> {
-        match claims {
-            Claims::Component(jwt::Claims {
-                issuer,
-                subject,
-                metadata,
-                ..
-            }) => {
-                let jwt::Component {
-                    name,
-                    tags,
-                    rev,
-                    ver,
-                    call_alias,
-                    ..
-                } = metadata
-                    .as_ref()
-                    .context("no metadata found on component claims")?;
-                Ok(StoredClaims::Component(StoredComponentClaims {
-                    call_alias: call_alias.clone().unwrap_or_default(),
-                    issuer: issuer.clone(),
-                    name: name.clone().unwrap_or_default(),
-                    revision: rev.unwrap_or_default().to_string(),
-                    subject: subject.clone(),
-                    tags: tags.clone().unwrap_or_default(),
-                    version: ver.clone().unwrap_or_default(),
-                }))
-            }
-            Claims::Provider(jwt::Claims {
-                issuer,
-                subject,
-                metadata,
-                ..
-            }) => {
-                let jwt::CapabilityProvider {
-                    name,
-                    rev,
-                    ver,
-                    config_schema,
-                    ..
-                } = metadata
-                    .as_ref()
-                    .context("no metadata found on provider claims")?;
-                Ok(StoredClaims::Provider(StoredProviderClaims {
-                    issuer: issuer.clone(),
-                    name: name.clone().unwrap_or_default(),
-                    revision: rev.unwrap_or_default().to_string(),
-                    subject: subject.clone(),
-                    version: ver.clone().unwrap_or_default(),
-                    config_schema: config_schema.as_ref().map(ToString::to_string),
-                }))
-            }
-        }
-    }
-}
-
-#[allow(clippy::implicit_hasher)]
-impl From<StoredClaims> for HashMap<String, String> {
-    fn from(claims: StoredClaims) -> Self {
-        match claims {
-            StoredClaims::Component(claims) => HashMap::from([
-                ("call_alias".to_string(), claims.call_alias),
-                ("iss".to_string(), claims.issuer.clone()), // TODO: remove in #1093
-                ("issuer".to_string(), claims.issuer),
-                ("name".to_string(), claims.name),
-                ("rev".to_string(), claims.revision.clone()), // TODO: remove in #1093
-                ("revision".to_string(), claims.revision),
-                ("sub".to_string(), claims.subject.clone()), // TODO: remove in #1093
-                ("subject".to_string(), claims.subject),
-                ("tags".to_string(), claims.tags.join(",")),
-                ("version".to_string(), claims.version),
-            ]),
-            StoredClaims::Provider(claims) => HashMap::from([
-                ("iss".to_string(), claims.issuer.clone()), // TODO: remove in #1093
-                ("issuer".to_string(), claims.issuer),
-                ("name".to_string(), claims.name),
-                ("rev".to_string(), claims.revision.clone()), // TODO: remove in #1093
-                ("revision".to_string(), claims.revision),
-                ("sub".to_string(), claims.subject.clone()), // TODO: remove in #1093
-                ("subject".to_string(), claims.subject),
-                ("version".to_string(), claims.version),
-                (
-                    "config_schema".to_string(),
-                    claims.config_schema.unwrap_or_default(),
-                ),
-            ]),
-        }
-    }
-}
-
-fn deserialize_messy_vec<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error> {
-    MessyVec::deserialize(deserializer).map(|messy_vec| messy_vec.0)
-}
-// Helper struct to deserialize either a comma-delimited string or an actual array of strings
-struct MessyVec(pub Vec<String>);
-
-struct MessyVecVisitor;
-
-// Since this is "temporary" code to preserve backwards compatibility with already-serialized claims,
-// we use fully-qualified names instead of importing
-impl<'de> serde::de::Visitor<'de> for MessyVecVisitor {
-    type Value = MessyVec;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("string or array of strings")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-
-        while let Some(value) = seq.next_element()? {
-            values.push(value);
-        }
-
-        Ok(MessyVec(values))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(MessyVec(value.split(',').map(String::from).collect()))
-    }
-}
-
-impl<'de> Deserialize<'de> for MessyVec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(MessyVecVisitor)
-    }
 }
 
 fn human_friendly_uptime(uptime: Duration) -> String {

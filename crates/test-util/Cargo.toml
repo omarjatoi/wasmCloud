@@ -1,6 +1,6 @@
 [package]
 name = "wasmcloud-test-util"
-version = "0.14.0"
+version = "0.17.0"
 rust-version = "1.78"
 description = """
 Utilities for testing wasmCloud hosts, providers, and components.
@@ -23,9 +23,7 @@ testcontainers = ["dep:testcontainers"]
 [dependencies]
 anyhow = { workspace = true }
 async-nats = { workspace = true }
-cloudevents-sdk = { workspace = true }
 nkeys = { workspace = true }
-rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 testcontainers = { workspace = true, optional = true }

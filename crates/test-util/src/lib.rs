@@ -60,6 +60,7 @@
 //!
 
 pub mod component;
+pub mod env;
 pub mod host;
 pub mod lattice;
 pub mod nats;
@@ -74,7 +75,7 @@ pub mod http;
 #[cfg(feature = "os")]
 pub mod os;
 
-/// Re-export of control interface fo ruse
+/// Re-export of control interface for use
 pub use wasmcloud_control_interface as control_interface;
 
 pub use crate::component::assert_scale_component;

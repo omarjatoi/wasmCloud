@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::span::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -25,7 +26,7 @@ impl<'a> TraceContextExtractor<'a> {
     }
 }
 
-impl<'a> Extractor for TraceContextExtractor<'a> {
+impl Extractor for TraceContextExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         // NOTE(thomastaylor312): I don't like that we have to iterate to find this, but I didn't
         // want to allocate hashmap for now. If this starts to cause performance issues, we can see
@@ -66,6 +67,22 @@ impl TraceContextInjector {
         header_map
     }
 
+    // Creates a new injector with the context extracted from the given extractor. If the context is empty, it will use the current span's context
+    pub fn new_with_extractor(extractor: &dyn Extractor) -> Self {
+        let mut header_map = Self::default();
+        let ctx_propagator = TraceContextPropagator::new();
+        let context = ctx_propagator.extract(extractor);
+
+        // Check if the extracted context is empty and use the current span's context if necessary
+        if !context.span().span_context().is_valid() {
+            ctx_propagator.inject_context(&Span::current().context(), &mut header_map);
+        } else {
+            ctx_propagator.inject_context(&context, &mut header_map);
+        }
+
+        header_map
+    }
+
     /// Convenience constructor that returns a new injector with the current span context already
     /// injected into a default [`TraceContext`]
     #[must_use]
@@ -75,10 +92,16 @@ impl TraceContextInjector {
         header_map
     }
 
-    /// Injects the current context from the span into the headers
+    /// Injects the context from the current span into the headers
     pub fn inject_context(&mut self) {
         let ctx_propagator = TraceContextPropagator::new();
         ctx_propagator.inject_context(&Span::current().context(), self);
+    }
+
+    /// Injects the context from the given span into the headers
+    pub fn inject_context_from_span(&mut self, span: &Span) {
+        let ctx_propagator = TraceContextPropagator::new();
+        ctx_propagator.inject_context(&span.context(), self);
     }
 }
 
@@ -114,8 +137,16 @@ impl From<TraceContextInjector> for TraceContext {
     }
 }
 
+/// A convenience function that will extract the [`opentelemetry::Context`] from the given
+/// [`TraceContext`]. If you want to do something more advanced, use the [`TraceContextExtractor`]
+pub fn get_span_context(trace_context: &TraceContext) -> opentelemetry::Context {
+    let ctx_propagator = TraceContextPropagator::new();
+    let extractor = TraceContextExtractor::new(trace_context);
+    ctx_propagator.extract(&extractor)
+}
+
 /// A convenience function that will extract from an incoming context and set the parent span for
-/// the current tracing Span.  If you want to do something more advanced, use the
+/// the current tracing Span. If you want to do something more advanced, use the
 /// [`TraceContextExtractor`] type directly
 ///
 /// **WARNING**: To avoid performance issues, this function does not check if you have empty tracing
@@ -123,8 +154,6 @@ impl From<TraceContextInjector> for TraceContext {
 /// hierarchy.**
 #[allow(clippy::module_name_repetitions)]
 pub fn attach_span_context(trace_context: &TraceContext) {
-    let ctx_propagator = TraceContextPropagator::new();
-    let extractor = TraceContextExtractor::new(trace_context);
-    let parent_ctx = ctx_propagator.extract(&extractor);
+    let parent_ctx = get_span_context(trace_context);
     Span::current().set_parent(parent_ctx);
 }

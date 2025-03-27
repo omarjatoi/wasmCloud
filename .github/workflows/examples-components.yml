@@ -22,8 +22,6 @@ on:
       - component-http-hello-world-tinygo-v[0-9]+.[0-9]+.[0-9]+-*
       - component-http-hello-world-python-v[0-9]+.[0-9]+.[0-9]+*
       - component-http-hello-world-python-v[0-9]+.[0-9]+.[0-9]+-*
-      - component-http-hello-world-typescript-v[0-9]+.[0-9]+.[0-9]+*
-      - component-http-hello-world-typescript-v[0-9]+.[0-9]+.[0-9]+-*
       - component-http-jsonify-v[0-9]+.[0-9]+.[0-9]+*
       - component-http-jsonify-v[0-9]+.[0-9]+.[0-9]+-*
       - component-http-keyvalue-counter-v[0-9]+.[0-9]+.[0-9]+*
@@ -32,121 +30,72 @@ on:
       - component-keyvalue-messaging-v[0-9]+.[0-9]+.[0-9]+-*
       - component-sqldb-postgres-query-v[0-9]+.[0-9]+.[0-9]+*
       - component-sqldb-postgres-query-v[0-9]+.[0-9]+.[0-9]+-*
-      - component-sqldb-postgres-query-tinygo-v[0-9]+.[0-9]+.[0-9]+*
-      - component-sqldb-postgres-query-tinygo-v[0-9]+.[0-9]+.[0-9]+-*
       - component-http-task-manager-v[0-9]+.[0-9]+.[0-9]+*
-      - component-http-password-checker-typescript-v[0-9]+.[0-9]+.[0-9]+*
-      - component-http-password-checker-typescript-v[0-9]+.[0-9]+.[0-9]+-*
+      - component-http-password-checker-rust-v[0-9]+.[0-9]+.[0-9]+*
+      - component-http-password-checker-rust-v[0-9]+.[0-9]+.[0-9]+-*
       - component-http-task-manager-v[0-9]+.[0-9]+.[0-9]+-*
+      - component-messaging-image-processor-worker-rust-v[0-9]+.[0-9]+.[0-9]+*
+      - component-messaging-image-processor-worker-rust-v[0-9]+.[0-9]+.[0-9]+-*
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/examples-components.yml
-      - crates/wash-lib/**
-      - crates/wash-cli/**
+      - crates/wash/**
       - examples/rust/components/**
       - examples/golang/components/**
       - examples/tinygo/components/**
       - examples/python/components/**
-      - examples/typescript/components/**
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-wash-cli:
-    name: build wash-cli
+  # build/cache wash-cli so following steps can use the cached version
+  prepare-wash-cache:
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        wash-version:
-          # NOTE(2024/10/23): we need to use the current version of wash *only*
-          # due to all the new WIT package retrieval goodness
-          #
-          # Once a new version of wash is out we can use prebuilt versions again (>= 35.0)
-          - current
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        if: ${{ matrix.wash-version == 'current' }}
-      - run: rustup show
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab
-        with:
-          shared-key: 'ubuntu-22.04-shared-cache'
-      - name: install wash (previous version)
-        if: ${{ matrix.wash-version != 'current' }}
-        uses: taiki-e/install-action@e35e2e777dde071a96489a02ac3f7d214dde10f1
-        with:
-          tool: wash-cli@${{ matrix.wash-version }}
-      - name: build wash (current)
-        if: ${{ matrix.wash-version == 'current' }}
-        run: cargo build -p wash-cli --release
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
-        if: ${{ matrix.wash-version == 'current' }}
-        with:
-          name: wash-${{ matrix.wash-version }}
-          path: ./target/release/wash
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
-        if: ${{ matrix.wash-version != 'current' }}
-        with:
-          name: wash-${{ matrix.wash-version }}
-          path: ~/.cargo/bin/wash
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/install-cached-wash-cli
 
   # Ensure that `wash build` and `wash app validate` works for all example projects below
   wash-build:
-    name: build
+    name: ${{ matrix.project.folder }}:${{ matrix.project.lang_version && format('{0}@{1}', matrix.project.lang, matrix.project.lang_version) || matrix.project.lang }} (wash@${{ matrix.wash-version }})
     runs-on: ubuntu-22.04
-    needs: [build-wash-cli]
+    needs: [prepare-wash-cache]
     strategy:
       fail-fast: false
       matrix:
         wash-version:
-          # NOTE(2024/10/23): we need to use the current version of wash *only*
-          # due to all the new WIT package retrieval goodness
-          #
-          # Once a new version of wash is out we can use prebuilt versions again (>= 35.0)
           - current
         project:
           # Golang example components
+          - folder: 'http-client-tinygo'
+            tag-prefix: 'component-http-client-tinygo-v'
+            lang: 'tinygo'
+            lang-version: '1.24.1'
+            test-deploy: wadm.yaml
+            wasm-bin: 'http_client_tinygo_s.wasm'
+
           - folder: 'http-echo-tinygo'
             tag-prefix: 'component-http-echo-tinygo-v'
             lang: 'tinygo'
-            lang_version: '1.21'
-            test_deploy: wadm.yaml
+            lang-version: '1.24.1'
+            test-deploy: wadm.yaml
+            wasm-bin: 'http-echo-tinygo-component_s.wasm'
 
           - folder: 'http-hello-world'
-            lang: 'tinygo'
             tag-prefix: 'component-http-hello-world-tinygo-v'
-            lang-version: '1.23'
+            lang: 'tinygo'
+            lang-version: '1.24.1'
             test-deploy: wadm.yaml
             wasm-bin: 'http_hello_world_s.wasm'
-
-          - folder: 'sqldb-postgres-query'
-            tag-prefix: 'component-sqldb-postgres-query-tinygo-v'
-            lang: 'tinygo'
-            lang-version: '1.21'
-            wasm-bin: 'sqldb_postgres_query_s.wasm'
-            test-deploy: local.wadm.yaml
-
-          - folder: 'http-echo-tinygo'
-            tag-prefix: 'component-http-echo-tinygo-v'
-            lang: 'tinygo'
-            lang-version: '1.21'
-            wasm-bin: 'http_echo_s.wasm'
-            test-deploy: wadm.yaml
-
-          - folder: 'sqldb-postgres-query'
-            tag-prefix: 'component-sqldb-postgres-query-tinygo-v'
-            lang: 'tinygo'
-            lang-version: '1.21'
-            wasm-bin: 'sqldb_postgres_query_s.wasm'
-            test-deploy: local.wadm.yaml
 
           # Rust example components
           - folder: 'blobby'
@@ -214,10 +163,23 @@ jobs:
             wasm-bin: 'http_task_manager_s.wasm'
             test-deploy: local.wadm.yaml
 
+          - folder: 'http-password-checker'
+            tag-prefix: 'component-http-password-checker-rust-v'
+            lang: 'rust'
+            wasm-bin: 'http_password_checker_s.wasm'
+            test-deploy: local.wadm.yaml
+
+          - folder: 'messaging-image-processor-worker'
+            tag-prefix: 'component-messaging-image-processor-worker-rust-v'
+            lang: 'rust'
+            wasm-bin: 'messaging_image_processor_worker_s.wasm'
+            test-deploy: local.wadm.yaml
+
           # Python example components
           - folder: 'http-hello-world'
             tag-prefix: 'component-http-hello-world-python-v'
             lang: 'python'
+            wasm-bin: 'http_hello_world_s.wasm'
             lang-version: '3.10'
 
           # Typescript example components
@@ -225,12 +187,14 @@ jobs:
             tag-prefix: 'component-http-hello-world-typescript-v'
             lang: 'typescript'
             lang-version: '20.x'
+            wasm-bin: 'http_hello_world_s.wasm'
             test_deploy: local.wadm.yaml
 
-          - folder: "http-password-checker"
+          - folder: 'http-password-checker'
             tag-prefix: 'component-http-password-checker-typescript-v'
-            lang: "typescript"
-            lang-version: "22.x"
+            lang: 'typescript'
+            lang-version: '22.x'
+            wasm-bin: 'http_password_checker_s.wasm'
             test_deploy: local.wadm.yaml
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -263,9 +227,8 @@ jobs:
         working-directory: examples/${{ matrix.project.lang }}/components/${{ matrix.project.folder }}
         run: |
           set -xe
-          wash up &
-          WASH_PID=$!
-          sleep 3;
+          wash up -d
+          sleep 4;
           wash app deploy ${{ matrix.project.test-deploy }};
           TRIES=0
           while [[ $(wash get inventory --output=json | jq '.inventories[0].components | length') -eq 0 ]] ; do
@@ -278,11 +241,11 @@ jobs:
           done;
           echo "✅ successfully started at least one component";
           wash app delete ${{ matrix.project.test-deploy }};
-          kill $WASH_PID;
+          wash down;
           exit 0;
 
       # Save example as an artifact for later step(s)
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ startswith(github.ref, format('refs/tags/{0}', matrix.project.tag-prefix)) }}
         with:
           name: wash-build-${{ matrix.wash-version }}-${{ matrix.project.lang }}-component-${{ matrix.project.folder }}
@@ -290,7 +253,7 @@ jobs:
 
   # Publish components relevant components if they've been tagged
   publish:
-    name: publish
+    name: ${{ matrix.project.folder }}:${{ matrix.project.lang_version && format('{0}@{1}', matrix.project.lang, matrix.project.lang_version) || matrix.project.lang }}
     runs-on: ubuntu-22.04
     needs: [wash-build]
     if: ${{ startswith(github.ref, 'refs/tags/component-') }}
@@ -301,23 +264,17 @@ jobs:
       fail-fast: false
       matrix:
         wash-version:
-          # NOTE(2024/10/23): we need to use the current version of wash *only*
-          # due to all the new WIT package retrieval goodness
-          #
-          # Once a new version of wash is out we can use prebuilt versions again (>= 35.0)
           - current
         project:
           # Go example components (to publish)
           - folder: 'http-echo-tinygo'
             tag-prefix: 'component-http-echo-tinygo-v'
             lang: 'tinygo'
-            lang-version: '1.21'
-            wasm-bin: 'http_echo_s.wasm'
+            wasm-bin: 'http-echo-tinygo-component_s.wasm'
 
           - folder: 'http-hello-world'
             tag-prefix: 'component-http-hello-world-tinygo-v'
             lang: 'tinygo'
-            lang-version: '1.21'
             wasm-bin: 'http_hello_world_s.wasm'
 
           # Rust example components (to publish)
@@ -376,16 +333,15 @@ jobs:
             lang: 'rust'
             wasm-bin: 'http_task_manager_s.wasm'
 
-          # Typescript
-          - folder: 'http-hello-world'
-            tag-prefix: 'component-http-hello-world-typescript-v'
-            lang: 'typescript'
-            wasm-bin: 'http_hello_world_s.wasm'
-
           - folder: 'http-password-checker'
-            tag-prefix: 'component-http-password-checker-typescript-v'
-            lang: 'typescript'
+            tag-prefix: 'component-http-password-checker-rust-v'
+            lang: 'rust'
             wasm-bin: 'http_password_checker_s.wasm'
+
+          - folder: 'messaging-image-processor-worker'
+            tag-prefix: 'component-messaging-image-processor-worker-rust-v'
+            lang: 'rust'
+            wasm-bin: 'messaging_image_processor_worker_s.wasm'
 
           # Python
           - folder: 'http-hello-world'
@@ -407,15 +363,16 @@ jobs:
           echo "bin-name=wash-build-${{ matrix.wash-version }}-${{ matrix.project.lang }}-component-${{ matrix.project.folder }}/${{ matrix.project.wasm-bin }}" >> $GITHUB_OUTPUT;
           echo "ref-prefix=$REF_PREFIX" >> $GITHUB_OUTPUT;
           echo "wasmcloud-toml-path=examples/${{ matrix.project.lang }}/components/${{ matrix.project.folder }}/wasmcloud.toml" >> $GITHUB_OUTPUT;
-      # Download all artifacts (wash binary and example component binaries) to work dir
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+      # Download all artifacts (example component binaries) to work dir
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
         with:
           path: artifacts
-      - name: install wash binary to PATH # Some build tools expect wash to be on the PATH
-        shell: bash
-        run: |
-          chmod +x ./artifacts/wash-${{ matrix.wash-version }}/wash;
-          echo "$(realpath ./artifacts/wash-${{ matrix.wash-version }})" >> "$GITHUB_PATH";
+      - name: install wash (current)
+        uses: taiki-e/cache-cargo-install-action@caa6f48d18d42462f9c30df89e2b4f71a42b7c2c # v2.0.1
+        with:
+          tool: wash
+          git: https://github.com/${{ github.repository }}
+          rev: ${{ github.sha }}
       # Push the project to GitHub Container Registry under various tags, if this is a release tag
       - name: Push SHA-tagged WebAssembly binary to GHCR
         if: ${{ startsWith(github.ref, steps.meta.outputs.ref-prefix) }}

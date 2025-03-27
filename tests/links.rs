@@ -49,8 +49,10 @@ async fn link_deletes() -> anyhow::Result<()> {
         )
         .try_init();
 
-    let (nats_server, nats_url, nats_client) =
-        start_nats().await.context("failed to start NATS")?;
+    let (nats_server, nats_url, nats_client) = start_nats(None, true)
+        .await
+        .map(|res| (res.0, res.1, res.2.unwrap()))
+        .context("failed to start NATS")?;
 
     // Build client for interacting with the lattice
     let ctl_client = wasmcloud_control_interface::ClientBuilder::new(nats_client.clone())
@@ -192,8 +194,10 @@ async fn link_name_support() -> anyhow::Result<()> {
         )
         .try_init();
 
-    let (nats_server, nats_url, nats_client) =
-        start_nats().await.context("failed to start NATS")?;
+    let (nats_server, nats_url, nats_client) = start_nats(None, true)
+        .await
+        .map(|res| (res.0, res.1, res.2.unwrap()))
+        .context("failed to start NATS")?;
 
     // Build client for interacting with the lattice
     let ctl_client = wasmcloud_control_interface::ClientBuilder::new(nats_client)
@@ -380,8 +384,10 @@ async fn valid_and_invalid() -> anyhow::Result<()> {
         )
         .try_init();
 
-    let (nats_server, nats_url, nats_client) =
-        start_nats().await.context("failed to start NATS")?;
+    let (nats_server, nats_url, nats_client) = start_nats(None, true)
+        .await
+        .map(|res| (res.0, res.1, res.2.unwrap()))
+        .context("failed to start NATS")?;
 
     // Build client for interacting with the lattice
     let ctl_client = wasmcloud_control_interface::ClientBuilder::new(nats_client)
@@ -434,24 +440,6 @@ async fn valid_and_invalid() -> anyhow::Result<()> {
         vec![interface_one, interface_two, interface_three],
     )
     .await?;
-    // NOTE: Defining one-at-a-time actually doesn't work. We need to be able to handle this
-    // TODO: disjoint sets issue
-    // define_link(
-    //     &ctl_client,
-    //     component_three,
-    //     component_one,
-    //     link_name_one,
-    //     vec![interface_two],
-    // )
-    // .await?;
-    // define_link(
-    //     &ctl_client,
-    //     component_three,
-    //     &component_one,
-    //     link_name_one,
-    //     vec![interface_three],
-    // )
-    // .await?;
 
     // Ensure links were validly created
     let resp = ctl_client
@@ -497,6 +485,24 @@ async fn valid_and_invalid() -> anyhow::Result<()> {
         component_two,
         link_name_three,
         vec![interface_one, interface_two, interface_three],
+    )
+    .await?;
+
+    // Components can be linked to different targets on different interfaces
+    define_link(
+        &ctl_client,
+        component_three,
+        component_one,
+        link_name_two,
+        vec![interface_two],
+    )
+    .await?;
+    define_link(
+        &ctl_client,
+        component_three,
+        component_two,
+        link_name_two,
+        vec![interface_three],
     )
     .await?;
 

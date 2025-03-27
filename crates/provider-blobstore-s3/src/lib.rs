@@ -226,7 +226,7 @@ impl StorageClient {
         if let Some(max_attempts) = max_attempts {
             retry_config = retry_config.with_max_attempts(max_attempts);
         }
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28())
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::v2025_01_17())
             .region(region)
             .credentials_provider(cred_provider)
             .retry_config(retry_config);
@@ -567,14 +567,12 @@ impl BlobstoreS3Provider {
             .await
             .context("failed to run provider")?;
         let connection = get_connection();
-        serve_provider_exports(
-            &connection.get_wrpc_client(connection.provider_key()),
-            provider,
-            shutdown,
-            serve,
-        )
-        .await
-        .context("failed to serve provider exports")
+        let wrpc = connection
+            .get_wrpc_client(connection.provider_key())
+            .await?;
+        serve_provider_exports(&wrpc, provider, shutdown, serve)
+            .await
+            .context("failed to serve provider exports")
     }
 
     /// Retrieve the per-component [`StorageClient`] for a given link context

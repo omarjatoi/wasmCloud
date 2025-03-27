@@ -4,9 +4,9 @@ This is a simple TinyGo Wasm example that responds with a "Hello World" message 
 
 ## Prerequisites
 
-- `go` 1.23
-- `tinygo` 0.33
-- [`wash`](https://wasmcloud.com/docs/installation) 0.35.0
+- `go` 1.24.1
+- `tinygo` 0.36
+- [`wash`](https://wasmcloud.com/docs/installation) 0.40.0
 - `wasmtime` 25.0.0 (if running with wasmtime)
 
 ## Building
@@ -30,7 +30,7 @@ Make sure to follow the build steps above, and replace the file path in [the wad
 ```shell
 wash up -d
 wash app deploy ./wadm.yaml
-curl http://localhost:8080
+curl http://localhost:8000
 ```
 
 ## Adding Capabilities

@@ -78,7 +78,7 @@ communicate and decide on a release date, and sometimes requests for releasing a
 sooner (often tied to a newly released Wasm feature) come from the community.
 
 As Wasm continues to stabilize, we will be switching to a release train style with scheduled release
-dates (preferrably monthly)
+dates (preferably monthly)
 
 ## Versioning
 
@@ -92,4 +92,4 @@ Backwards-incompatible changes are never added except in case of an issue with s
 
 Within the wasmCloud monorepo, each project or binary has different tags. The top level tag (i.e.
 `v1.3.1`) is reserved for the main wasmCloud host. All other tags follow the convention of
-`$dash-separated-project-v$version` (e.g. `wash-cli-v0.35.0`)
+`$dash-separated-project-v$version` (e.g. `wash-v0.35.0`)

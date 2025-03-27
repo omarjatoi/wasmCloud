@@ -1,5 +1,7 @@
 use crate::OciConfig;
 
+use core::net::SocketAddr;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +10,8 @@ use nkeys::KeyPair;
 use url::Url;
 use wasmcloud_core::{logging::Level as LogLevel, OtelConfig};
 use wasmcloud_runtime::{MAX_COMPONENTS, MAX_COMPONENT_SIZE, MAX_LINEAR_MEMORY};
+
+use crate::wasmbus::experimental::Features;
 
 /// wasmCloud Host configuration
 #[allow(clippy::struct_excessive_bools)]
@@ -72,6 +76,14 @@ pub struct Host {
     pub max_components: u32,
     /// The interval at which the Host will send heartbeats
     pub heartbeat_interval: Option<Duration>,
+    /// Experimental features that can be enabled in the host
+    pub experimental_features: Features,
+    /// HTTP administration endpoint address
+    pub http_admin: Option<SocketAddr>,
+    /// Whether component auctions are enabled
+    pub enable_component_auction: bool,
+    /// Whether capability provider auctions are enabled
+    pub enable_provider_auction: bool,
 }
 
 /// Configuration for wasmCloud policy service
@@ -121,6 +133,10 @@ impl Default for Host {
             max_component_size: MAX_COMPONENT_SIZE,
             max_components: MAX_COMPONENTS,
             heartbeat_interval: None,
+            experimental_features: Features::default(),
+            http_admin: None,
+            enable_component_auction: true,
+            enable_provider_auction: true,
         }
     }
 }

@@ -22,7 +22,7 @@ wash build
 You must have wasmtime >=19.0.0 for this to work. Make sure to follow the build step above first.
 
 ```bash
-wasmtime serve -Scommon ./build/http_hello_world_s.wasm
+wasmtime serve -Scommon ./http_hello_world_s.wasm
 ```
 
 ## Running with wasmCloud
@@ -33,5 +33,5 @@ Ensuring you've built your component with `wash build`, you can launch wasmCloud
 wash up -d
 wash app deploy ./wadm.yaml
 wash app get
-curl http://127.0.0.1:8080
+curl http://127.0.0.1:8000
 ```

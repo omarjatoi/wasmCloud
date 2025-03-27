@@ -1,13 +1,13 @@
-use super::{Ctx, Handler};
-
-use crate::capability::secrets::store::{HostSecret, Secret, SecretValue};
-use crate::capability::secrets::{self, reveal, store};
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::instrument;
 use wasmtime::component::Resource;
+
+use crate::capability::secrets::store::{HostSecret, Secret, SecretValue};
+use crate::capability::secrets::{self, reveal, store};
+
+use super::{Ctx, Handler};
 
 /// `wasmcloud:secrets` implementation
 #[async_trait]
@@ -40,6 +40,7 @@ impl<H: Handler> store::Host for Ctx<H> {
         &mut self,
         key: String,
     ) -> anyhow::Result<Result<Resource<Secret>, store::SecretsError>> {
+        self.attach_parent_context();
         let secret = Secrets::get(&self.handler, &key).await?;
         if let Some(err) = secret.err() {
             Ok(Err(err))
@@ -54,6 +55,7 @@ impl<H: Handler> store::Host for Ctx<H> {
 impl<H: Handler> reveal::Host for Ctx<H> {
     #[instrument(skip(self))]
     async fn reveal(&mut self, secret: Resource<Secret>) -> anyhow::Result<SecretValue> {
+        self.attach_parent_context();
         let key = self.table.get(&secret)?;
         let secret_value = self.handler.reveal(key.clone()).await?;
         Ok(secret_value)

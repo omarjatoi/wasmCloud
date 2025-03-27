@@ -2,18 +2,14 @@ name: nix
 
 on:
   pull_request:
-    paths-ignore:
-      - typescript/**
   merge_group:
   push:
-    paths-ignore:
-      - typescript/**
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,7 +20,7 @@ jobs:
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-      - run: nix fmt
+      - run: nix fmt -L $(find . -type f -name '*.nix')
 
   run:
     runs-on: ubuntu-22.04
@@ -33,7 +29,7 @@ jobs:
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-      - run: nix run -L . -- --version
+      - run: nix run --fallback -L . -- --version
 
   develop:
     runs-on: ubuntu-22.04
@@ -42,4 +38,4 @@ jobs:
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-      - run: nix develop -L --ignore-environment -c cargo tree
+      - run: nix develop --fallback -L --ignore-environment -c cargo tree

@@ -64,7 +64,7 @@ pub fn extract_claims(contents: impl AsRef<[u8]>) -> Result<Option<Token<Compone
 /// This function will embed a set of claims inside the bytecode of a WebAssembly module. The claims
 /// are converted into a JWT and signed using the provided `KeyPair`.
 /// According to the WebAssembly [custom section](https://webassembly.github.io/spec/core/appendix/custom.html)
-/// specification, arbitary sets of bytes can be stored in a WebAssembly module without impacting
+/// specification, arbitrary sets of bytes can be stored in a WebAssembly module without impacting
 /// parsers or interpreters. Returns a vector of bytes representing the new WebAssembly module which can
 /// be saved to a `.wasm` file
 #[allow(clippy::missing_errors_doc)] // TODO: document errors
@@ -245,7 +245,7 @@ mod test {
                 None,
             )),
             expires: None,
-            id: nuid::next(),
+            id: nuid::next().to_string(),
             issued_at: 0,
             issuer: kp.public_key(),
             subject: "test.wasm".to_string(),
@@ -286,7 +286,7 @@ mod test {
                 None,
             )),
             expires: None,
-            id: nuid::next(),
+            id: nuid::next().to_string(),
             issued_at: 0,
             issuer: kp.public_key(),
             subject: "test.wasm".to_string(),
@@ -319,7 +319,7 @@ mod test {
                 None,
             )),
             expires: None,
-            id: nuid::next(),
+            id: nuid::next().to_string(),
             issued_at: 0,
             issuer: kp.public_key(),
             subject: "test.wasm".to_string(),
@@ -352,7 +352,7 @@ mod test {
                 None,
             )),
             expires: None,
-            id: nuid::next(),
+            id: nuid::next().to_string(),
             issued_at: 0,
             issuer: kp.public_key(),
             subject: "test.wasm".to_string(),
@@ -393,7 +393,7 @@ mod test {
                 Some("somealias".to_string()),
             )),
             expires: None,
-            id: nuid::next(),
+            id: nuid::next().to_string(),
             issued_at: 0,
             issuer: kp.public_key(),
             subject: "test.wasm".to_string(),

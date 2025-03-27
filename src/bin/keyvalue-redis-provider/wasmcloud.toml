@@ -1,7 +1,8 @@
 name = "KV Redis"
 language = "rust"
 type = "provider"
-version = "0.28.0"
+version = "0.29.0"
+wit = "../../../crates/provider-keyvalue-redis/wit"
 
 [rust]
 target_path = "../../../target"

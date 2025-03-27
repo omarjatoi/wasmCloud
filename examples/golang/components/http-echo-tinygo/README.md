@@ -20,7 +20,7 @@ This repository contains a [Web Assembly System Interface ("WASI")][wasi] and [C
 Before starting, ensure that you have the following installed:
 
 - The [TinyGo toolchain][tinygo-toolchain]
-- [`wash`, the WebAssembly SHell][wash] installed.
+- [`wash`, the WAsmcloud SHell][wash] installed.
 
 ## Build the WASI component
 
@@ -71,7 +71,7 @@ First, edit `wadm.yaml` to include the absolute path to the signed WebAssembly m
     - name: http-echo-tinygo
       type: component
       properties:
--        # TODO: you must replace the path below to match your genreated code in build
+-        # TODO: you must replace the path below to match your generated code in build
 -       image: file:///absolute/path/to/this/repo/build/http-echo-tinygo_s.wasm
 +       image: file:///the/absolute/path/to/build/http-echo-tinygo-component_s.wasm
       traits:
@@ -107,7 +107,7 @@ go test -tags e2e
 > Note that the tests use `go`, _not_ `tinygo`, and require `wash` to be installed
 
 [wasmcloud]: https://github.com/wasmCloud/wasmCloud
-[wash]: https://github.com/wasmCloud/wasmCloud/tree/main/crates/wash-cli
+[wash]: https://github.com/wasmCloud/wasmCloud/tree/main/crates/wash
 [go]: https://go.dev
 [tinygo]: https://tinygo.org
 [tinygo-toolchain]: https://tinygo.org/getting-started/install/

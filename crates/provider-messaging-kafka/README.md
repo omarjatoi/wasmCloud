@@ -135,7 +135,7 @@ spec:
         # Govern the spread/scheduling of the component
         - type: spreadscaler
           properties:
-            replicas: 1
+            instances: 1
         - type: link
           properties:
             target: nats
@@ -151,7 +151,7 @@ spec:
     - name: nats
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/messaging-nats:0.23.1
+        image: ghcr.io/wasmcloud/messaging-nats:0.26.0
 ```
 
 Then, we must set up the named config that we're expecting to see (`simple-subscription`):
@@ -190,7 +190,7 @@ docker exec -it \
     --from-beginning
 ```
 
-Then, you should be able to send a message using the kafka container (note that this comamnd will not return, but will instead produce a prompt):
+Then, you should be able to send a message using the kafka container (note that this command will not return, but will instead produce a prompt):
 
 ```console
 docker exec -it \
@@ -203,5 +203,5 @@ docker exec -it \
 Messages you send via the producer will be echoed first in the original consumer (`wasmcloud.echo`) and _also_ echoed in `wasmcloud.echo.reply`, which is the work of the `echo-messaging` component and the default functionality of this provider (supplying a generated `reply_to` topic).
 
 [docker]: https://docs.docker.com
-[wash]: https://github.com/wasmCloud/wasmCloud/tree/main/crates/wash-cli
+[wash]: https://github.com/wasmCloud/wasmCloud/tree/main/crates/wash
 [wadm]: https://github.com/wasmCloud/wadm

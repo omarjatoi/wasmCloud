@@ -44,7 +44,7 @@ spec:
         # Govern the spread/scheduling of the component
         - type: spreadscaler
           properties:
-            replicas: 1
+            instances: 1
         # Link the component to Redis on the default Redis port
         #
         # Establish a unidirectional link to the `kvredis` (the keyvalue capability provider),
@@ -65,13 +65,13 @@ spec:
     - name: kvredis
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/keyvalue-redis:0.28.1
+        image: ghcr.io/wasmcloud/keyvalue-redis:0.29.0
 
     # Add a capability provider that enables HTTP access
     - name: httpserver
       type: capability
       properties:
-        image: ghcr.io/wasmcloud/http-server:0.23.1
+        image: ghcr.io/wasmcloud/http-server:0.27.0
       traits:
         # Link the httpserver to the component, and configure the HTTP server
         # to listen on port 8080 for incoming requests

@@ -30,13 +30,13 @@ rustup toolchain install nightly
 Follow the instructions for your OS on the [Installation page](https://wasmcloud.com/docs/installation). Since several of the following tools use [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html), you may wish to use `wash` through Cargo as well.
 
 ```shell
-cargo install --locked wash-cli
+cargo install --locked wash
 ```
 
 If you have [`cargo-binstall`][cargo-binstall] installed, you can install even faster:
 
 ```bash
-cargo binstall wash-cli
+cargo binstall wash
 ```
 
 [cargo-binstall]: https://crates.io/crates/cargo-binstall
@@ -121,7 +121,7 @@ Now we'll start a local wasmCloud host in detached mode, deploy the component, a
 ```shell
 wash up -d
 wash app deploy wadm.yaml
-curl localhost:8080
+curl localhost:8000
 ```
 Once we see that everything is running as expected in wasmCloud, we can undeploy the app.
 
@@ -204,7 +204,7 @@ wash app deploy wadm.yaml
 When we invoke `http-hello-world` via `curl`, it invokes `pong`:
 
 ```shell
-curl localhost:8080
+curl localhost:8000
 Hello World! I got pong demo
 ```
 
@@ -271,7 +271,7 @@ Let's try running it with Wasmtime:
 wasmtime serve -S cli=y output.wasm
 ```
 ```shell
-curl localhost:8080
+curl localhost:8000
 Hello World! I got pong demo
 ```
 We can run the composed component in wasmCloud as well:

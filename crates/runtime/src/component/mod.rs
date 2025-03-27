@@ -1,8 +1,6 @@
-use crate::capability::{self};
-use crate::Runtime;
-
 use core::fmt::{self, Debug};
 use core::future::Future;
+use core::ops::Deref;
 use core::pin::Pin;
 use core::time::Duration;
 
@@ -10,7 +8,8 @@ use anyhow::{ensure, Context as _};
 use futures::{Stream, TryStreamExt as _};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::sync::mpsc;
-use tracing::{debug, instrument, warn, Instrument as _, Span};
+use tracing::{debug, info_span, instrument, warn, Instrument as _, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wascap::jwt;
 use wascap::wasm::extract_claims;
 use wasi_preview1_component_adapter_provider::{
@@ -23,10 +22,20 @@ use wrpc_runtime_wasmtime::{
     collect_component_resources, link_item, ServeExt as _, SharedResourceTable, WrpcView,
 };
 
+use crate::capability::{self, wrpc};
+use crate::experimental::Features;
+use crate::Runtime;
+
 pub use bus::Bus;
 pub use bus1_0_0::Bus as Bus1_0_0;
 pub use config::Config;
+pub use identity::Identity;
 pub use logging::Logging;
+pub use messaging::v0_2::Messaging as Messaging0_2;
+pub use messaging::v0_3::{
+    Client as MessagingClient0_3, GuestMessage as MessagingGuestMessage0_3,
+    HostMessage as MessagingHostMessage0_3, Messaging as Messaging0_3,
+};
 pub use secrets::Secrets;
 
 pub(crate) mod blobstore;
@@ -34,9 +43,10 @@ mod bus;
 mod bus1_0_0;
 mod config;
 mod http;
+mod identity;
 mod keyvalue;
 mod logging;
-mod messaging;
+pub(crate) mod messaging;
 mod secrets;
 
 /// Instance target, which is replaced in wRPC
@@ -54,128 +64,27 @@ pub enum ReplacedInstanceTarget {
     KeyvalueStore,
     /// `wasi:keyvalue/batch` instance replacement
     KeyvalueBatch,
+    /// `wasi:keyvalue/watch` instance replacment
+    KeyvalueWatch,
     /// `wasi:http/incoming-handler` instance replacement
     HttpIncomingHandler,
     /// `wasi:http/outgoing-handler` instance replacement
     HttpOutgoingHandler,
 }
 
-/// skips instance names, for which static (builtin) bindings exist
-macro_rules! skip_static_instances {
-    ($instance:expr) => {
-        match ($instance) {
-            "wasi:blobstore/blobstore@0.2.0-draft"
-            | "wasi:blobstore/container@0.2.0-draft"
-            | "wasi:blobstore/types@0.2.0-draft"
-            | "wasi:cli/environment@0.2.0"
-            | "wasi:cli/environment@0.2.1"
-            | "wasi:cli/environment@0.2.2"
-            | "wasi:cli/exit@0.2.0"
-            | "wasi:cli/exit@0.2.1"
-            | "wasi:cli/exit@0.2.2"
-            | "wasi:cli/stderr@0.2.0"
-            | "wasi:cli/stderr@0.2.1"
-            | "wasi:cli/stderr@0.2.2"
-            | "wasi:cli/stdin@0.2.0"
-            | "wasi:cli/stdin@0.2.1"
-            | "wasi:cli/stdin@0.2.2"
-            | "wasi:cli/stdout@0.2.0"
-            | "wasi:cli/stdout@0.2.1"
-            | "wasi:cli/stdout@0.2.2"
-            | "wasi:cli/terminal-input@0.2.0"
-            | "wasi:cli/terminal-input@0.2.1"
-            | "wasi:cli/terminal-input@0.2.2"
-            | "wasi:cli/terminal-output@0.2.0"
-            | "wasi:cli/terminal-output@0.2.1"
-            | "wasi:cli/terminal-output@0.2.2"
-            | "wasi:cli/terminal-stderr@0.2.0"
-            | "wasi:cli/terminal-stderr@0.2.1"
-            | "wasi:cli/terminal-stderr@0.2.2"
-            | "wasi:cli/terminal-stdin@0.2.0"
-            | "wasi:cli/terminal-stdin@0.2.1"
-            | "wasi:cli/terminal-stdin@0.2.2"
-            | "wasi:cli/terminal-stdout@0.2.0"
-            | "wasi:cli/terminal-stdout@0.2.1"
-            | "wasi:cli/terminal-stdout@0.2.2"
-            | "wasi:clocks/monotonic-clock@0.2.0"
-            | "wasi:clocks/monotonic-clock@0.2.1"
-            | "wasi:clocks/monotonic-clock@0.2.2"
-            | "wasi:clocks/timezone@0.2.1"
-            | "wasi:clocks/timezone@0.2.2"
-            | "wasi:clocks/wall-clock@0.2.0"
-            | "wasi:clocks/wall-clock@0.2.1"
-            | "wasi:clocks/wall-clock@0.2.2"
-            | "wasi:config/runtime@0.2.0-draft"
-            | "wasi:config/store@0.2.0-draft"
-            | "wasi:filesystem/preopens@0.2.0"
-            | "wasi:filesystem/preopens@0.2.1"
-            | "wasi:filesystem/preopens@0.2.2"
-            | "wasi:filesystem/types@0.2.0"
-            | "wasi:filesystem/types@0.2.1"
-            | "wasi:filesystem/types@0.2.2"
-            | "wasi:http/incoming-handler@0.2.0"
-            | "wasi:http/incoming-handler@0.2.1"
-            | "wasi:http/incoming-handler@0.2.2"
-            | "wasi:http/outgoing-handler@0.2.0"
-            | "wasi:http/outgoing-handler@0.2.1"
-            | "wasi:http/outgoing-handler@0.2.2"
-            | "wasi:http/types@0.2.0"
-            | "wasi:http/types@0.2.1"
-            | "wasi:http/types@0.2.2"
-            | "wasi:io/error@0.2.0"
-            | "wasi:io/error@0.2.1"
-            | "wasi:io/error@0.2.2"
-            | "wasi:io/poll@0.2.0"
-            | "wasi:io/poll@0.2.1"
-            | "wasi:io/poll@0.2.2"
-            | "wasi:io/streams@0.2.0"
-            | "wasi:io/streams@0.2.1"
-            | "wasi:io/streams@0.2.2"
-            | "wasi:keyvalue/atomics@0.2.0-draft"
-            | "wasi:keyvalue/batch@0.2.0-draft"
-            | "wasi:keyvalue/store@0.2.0-draft"
-            | "wasi:logging/logging"
-            | "wasi:logging/logging@0.1.0-draft"
-            | "wasi:random/insecure-seed@0.2.0"
-            | "wasi:random/insecure-seed@0.2.1"
-            | "wasi:random/insecure-seed@0.2.2"
-            | "wasi:random/insecure@0.2.0"
-            | "wasi:random/insecure@0.2.1"
-            | "wasi:random/insecure@0.2.2"
-            | "wasi:random/random@0.2.0"
-            | "wasi:random/random@0.2.1"
-            | "wasi:random/random@0.2.2"
-            | "wasi:sockets/instance-network@0.2.0"
-            | "wasi:sockets/instance-network@0.2.1"
-            | "wasi:sockets/instance-network@0.2.2"
-            | "wasi:sockets/ip-name-lookup@0.2.0"
-            | "wasi:sockets/ip-name-lookup@0.2.1"
-            | "wasi:sockets/ip-name-lookup@0.2.2"
-            | "wasi:sockets/network@0.2.0"
-            | "wasi:sockets/network@0.2.1"
-            | "wasi:sockets/network@0.2.2"
-            | "wasi:sockets/tcp-create-socket@0.2.0"
-            | "wasi:sockets/tcp-create-socket@0.2.1"
-            | "wasi:sockets/tcp-create-socket@0.2.2"
-            | "wasi:sockets/tcp@0.2.0"
-            | "wasi:sockets/tcp@0.2.1"
-            | "wasi:sockets/tcp@0.2.2"
-            | "wasi:sockets/udp-create-socket@0.2.0"
-            | "wasi:sockets/udp-create-socket@0.2.1"
-            | "wasi:sockets/udp-create-socket@0.2.2"
-            | "wasi:sockets/udp@0.2.0"
-            | "wasi:sockets/udp@0.2.1"
-            | "wasi:sockets/udp@0.2.2"
-            | "wasmcloud:bus/lattice@1.0.0"
-            | "wasmcloud:bus/lattice@2.0.0"
-            | "wasmcloud:messaging/consumer@0.2.0"
-            | "wasmcloud:messaging/handler@0.2.0"
-            | "wasmcloud:messaging/types@0.2.0"
-            | "wasmcloud:secrets/reveal@0.1.0-draft"
-            | "wasmcloud:secrets/store@0.1.0-draft" => continue,
-            _ => {}
-        }
-    };
+fn is_0_2(version: &str, min_patch: u64) -> bool {
+    if let Ok(semver::Version {
+        major,
+        minor,
+        patch,
+        pre,
+        build,
+    }) = version.parse()
+    {
+        major == 0 && minor == 2 && patch >= min_patch && pre.is_empty() && build.is_empty()
+    } else {
+        false
+    }
 }
 
 /// This represents a kind of wRPC invocation error
@@ -201,6 +110,9 @@ pub trait Handler:
     + Config
     + Logging
     + Secrets
+    + Messaging0_2
+    + Messaging0_3
+    + Identity
     + InvocationErrorIntrospect
     + Send
     + Sync
@@ -215,6 +127,9 @@ impl<
             + Config
             + Logging
             + Secrets
+            + Messaging0_2
+            + Messaging0_3
+            + Identity
             + InvocationErrorIntrospect
             + Send
             + Sync
@@ -269,6 +184,7 @@ where
     claims: Option<jwt::Claims<jwt::Component>>,
     instance_pre: wasmtime::component::InstancePre<Ctx<H>>,
     max_execution_time: Duration,
+    experimental_features: Features,
 }
 
 impl<H> Debug for Component<H>
@@ -304,6 +220,7 @@ fn new_store<H: Handler>(
             table,
             shared_resources: SharedResourceTable::default(),
             timeout: max_execution_time,
+            parent_context: None,
         },
     );
     store.set_epoch_deadline(max_execution_time.as_secs());
@@ -407,14 +324,30 @@ where
 
         capability::bus1_0_0::lattice::add_to_linker(&mut linker, |ctx| ctx)
             .context("failed to link `wasmcloud:bus/lattice@1.0.0`")?;
-        capability::bus::lattice::add_to_linker(&mut linker, |ctx| ctx)
+        capability::bus2_0_0::lattice::add_to_linker(&mut linker, |ctx| ctx)
             .context("failed to link `wasmcloud:bus/lattice@2.0.0`")?;
-        capability::messaging::consumer::add_to_linker(&mut linker, |ctx| ctx)
-            .context("failed to link `wasmcloud:messaging/consumer`")?;
+        capability::messaging0_2_0::types::add_to_linker(&mut linker, |ctx| ctx)
+            .context("failed to link `wasmcloud:messaging/types@0.2.0`")?;
+        capability::messaging0_2_0::consumer::add_to_linker(&mut linker, |ctx| ctx)
+            .context("failed to link `wasmcloud:messaging/consumer@0.2.0`")?;
         capability::secrets::reveal::add_to_linker(&mut linker, |ctx| ctx)
             .context("failed to link `wasmcloud:secrets/reveal`")?;
         capability::secrets::store::add_to_linker(&mut linker, |ctx| ctx)
             .context("failed to link `wasmcloud:secrets/store`")?;
+        // Only link wasmcloud:messaging@v3 if the feature is enabled
+        if rt.experimental_features.wasmcloud_messaging_v3 {
+            capability::messaging0_3_0::types::add_to_linker(&mut linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:messaging/types@0.3.0`")?;
+            capability::messaging0_3_0::producer::add_to_linker(&mut linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:messaging/producer@0.3.0`")?;
+            capability::messaging0_3_0::request_reply::add_to_linker(&mut linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:messaging/request-reply@0.3.0`")?;
+        }
+        // Only link wasmcloud:identity if the workload identity feature is enabled
+        if rt.experimental_features.workload_identity_interface {
+            capability::identity::store::add_to_linker(&mut linker, |ctx| ctx)
+                .context("failed to link `wasmcloud:identity/store`")?;
+        }
 
         let ty = component.component_type();
         let mut guest_resources = Vec::new();
@@ -423,9 +356,53 @@ where
             warn!("exported component resources are not supported in wasmCloud runtime and will be ignored, use a provider instead to enable this functionality");
         }
         for (name, ty) in ty.imports(&engine) {
-            skip_static_instances!(name);
-            link_item(&engine, &mut linker.root(), [], ty, "", name, None)
-                .context("failed to link item")?;
+            // Don't link builtin instances or feature-gated instances if the feature is disabled
+            match name.split_once('/').map(|(pkg, suffix)| {
+                suffix
+                    .split_once('@')
+                    .map_or((pkg, suffix, None), |(iface, version)| {
+                        (pkg, iface, Some(version))
+                    })
+            }) {
+                Some(
+                    ("wasi:blobstore", "blobstore" | "container" | "types", Some("0.2.0-draft"))
+                    | ("wasi:config", "runtime" | "store", Some("0.2.0-draft"))
+                    | ("wasi:keyvalue", "atomics" | "batch" | "store", Some("0.2.0-draft"))
+                    | ("wasi:logging", "logging", None | Some("0.1.0-draft"))
+                    | ("wasmcloud:bus", "lattice", Some("1.0.0" | "2.0.0"))
+                    | ("wasmcloud:messaging", "consumer" | "types", Some("0.2.0"))
+                    | ("wasmcloud:secrets", "reveal" | "store", Some("0.1.0-draft")),
+                ) => {}
+                Some((
+                    "wasi:cli",
+                    "environment" | "exit" | "stderr" | "stdin" | "stdout" | "terminal-input"
+                    | "terminal-output" | "terminal-stderr" | "terminal-stdin" | "terminal-stdout",
+                    Some(version),
+                )) if is_0_2(version, 0) => {}
+                Some(("wasi:clocks", "monotonic-clock" | "wall-clock", Some(version)))
+                    if is_0_2(version, 0) => {}
+                Some(("wasi:clocks", "timezone", Some(version))) if is_0_2(version, 1) => {}
+                Some(("wasi:filesystem", "preopens" | "types", Some(version)))
+                    if is_0_2(version, 0) => {}
+                Some((
+                    "wasi:http",
+                    "incoming-handler" | "outgoing-handler" | "types",
+                    Some(version),
+                )) if is_0_2(version, 0) => {}
+                Some(("wasi:io", "error" | "poll" | "streams", Some(version)))
+                    if is_0_2(version, 0) => {}
+                Some(("wasi:random", "insecure-seed" | "insecure" | "random", Some(version)))
+                    if is_0_2(version, 0) => {}
+                Some((
+                    "wasi:sockets",
+                    "instance-network" | "ip-name-lookup" | "network" | "tcp-create-socket" | "tcp"
+                    | "udp-create-socket" | "udp",
+                    Some(version),
+                )) if is_0_2(version, 0) => {}
+                _ if rt.skip_feature_gated_instance(name) => {}
+                _ => link_item(&engine, &mut linker.root(), [], ty, "", name, None)
+                    .context("failed to link item")?,
+            };
         }
         let instance_pre = linker.instantiate_pre(&component)?;
         Ok(Self {
@@ -433,6 +410,7 @@ where
             claims,
             instance_pre,
             max_execution_time: rt.max_execution_time,
+            experimental_features: rt.experimental_features,
         })
     }
 
@@ -476,6 +454,22 @@ where
         self.claims.as_ref()
     }
 
+    /// Instantiates the component given a handler and event channel
+    pub fn instantiate<C>(
+        &self,
+        handler: H,
+        events: mpsc::Sender<WrpcServeEvent<C>>,
+    ) -> Instance<H, C> {
+        Instance {
+            engine: self.engine.clone(),
+            pre: self.instance_pre.clone(),
+            handler,
+            max_execution_time: self.max_execution_time,
+            events,
+            experimental_features: self.experimental_features,
+        }
+    }
+
     /// Serve all exports of this [Component] using supplied [`wrpc_transport::Serve`]
     ///
     /// The returned [Vec] contains an [InvocationStream] per each function exported by the component.
@@ -491,17 +485,11 @@ where
     ) -> anyhow::Result<Vec<InvocationStream>>
     where
         S: wrpc_transport::Serve,
+        S::Context: Deref<Target = tracing::Span>,
     {
-        let span = Span::current();
         let max_execution_time = self.max_execution_time;
         let mut invocations = vec![];
-        let instance = Instance {
-            engine: self.engine.clone(),
-            pre: self.instance_pre.clone(),
-            handler: handler.clone(),
-            max_execution_time: self.max_execution_time,
-            events: events.clone(),
-        };
+        let instance = self.instantiate(handler.clone(), events.clone());
         for (name, ty) in self
             .instance_pre
             .component()
@@ -522,17 +510,30 @@ where
                     invocations.push(handle);
                 }
                 (
-                    "wasmcloud:messaging/handler@0.2.0",
+                    "wasmcloud:messaging/handler@0.2.0"
+                    | "wasmcloud:messaging/incoming-handler@0.3.0",
                     types::ComponentItem::ComponentInstance(..),
                 ) => {
                     let instance = instance.clone();
-                    let [(_, _, handle_message)] = messaging::wrpc_handler_bindings::exports::wasmcloud::messaging::handler::serve_interface(
-                            srv,
-                            instance,
+                    let [(_, _, handle_message)] =
+                        wrpc::exports::wasmcloud::messaging0_2_0::handler::serve_interface(
+                            srv, instance,
                         )
                         .await
-                    .context("failed to serve `wasmcloud:messaging/handler`")?;
+                        .context("failed to serve `wasmcloud:messaging/handler`")?;
                     invocations.push(handle_message);
+                }
+                (
+                    "wasi:keyvalue/watcher@0.2.0-draft",
+                    types::ComponentItem::ComponentInstance(..),
+                ) => {
+                    let instance = instance.clone();
+                    let [(_, _, on_set), (_, _, on_delete)] =
+                        wrpc::exports::wrpc::keyvalue::watcher::serve_interface(srv, instance)
+                            .await
+                            .context("failed to serve `wrpc:keyvalue/watcher`")?;
+                    invocations.push(on_set);
+                    invocations.push(on_delete);
                 }
                 (name, types::ComponentItem::ComponentFunc(ty)) => {
                     let engine = self.engine.clone();
@@ -541,7 +542,13 @@ where
                     debug!(?name, "serving root function");
                     let func = srv
                         .serve_function(
-                            move || new_store(&engine, handler.clone(), max_execution_time),
+                            move || {
+                                let span = info_span!("call_instance_function");
+                                let mut store =
+                                    new_store(&engine, handler.clone(), max_execution_time);
+                                store.data_mut().parent_context = Some(span.context());
+                                store
+                            },
                             pre,
                             ty,
                             "",
@@ -550,12 +557,13 @@ where
                         .await
                         .context("failed to serve root function")?;
                     let events = events.clone();
-                    let span = span.clone();
                     invocations.push(Box::pin(func.map_ok(move |(cx, res)| {
                         let events = events.clone();
+                        let span = cx.deref().clone();
                         Box::pin(
                             async move {
-                                let res = res.await;
+                                let res =
+                                    res.instrument(info_span!("handle_instance_function")).await;
                                 let success = res.is_ok();
                                 if let Err(err) =
                                     events.try_send(WrpcServeEvent::DynamicExportReturned {
@@ -570,7 +578,7 @@ where
                                 }
                                 res
                             }
-                            .instrument(span.clone()),
+                            .instrument(span),
                         )
                             as Pin<Box<dyn Future<Output = _> + Send + 'static>>
                     })));
@@ -595,7 +603,14 @@ where
                                 let func = srv
                                     .serve_function(
                                         move || {
-                                            new_store(&engine, handler.clone(), max_execution_time)
+                                            let span = info_span!("call_instance_function");
+                                            let mut store = new_store(
+                                                &engine,
+                                                handler.clone(),
+                                                max_execution_time,
+                                            );
+                                            store.data_mut().parent_context = Some(span.context());
+                                            store
                                         },
                                         pre,
                                         ty,
@@ -605,9 +620,9 @@ where
                                     .await
                                     .context("failed to serve instance function")?;
                                 let events = events.clone();
-                                let span = span.clone();
                                 invocations.push(Box::pin(func.map_ok(move |(cx, res)| {
                                     let events = events.clone();
+                                    let span = cx.deref().clone();
                                     Box::pin(
                                         async move {
                                             let res = res.await;
@@ -626,7 +641,7 @@ where
                                             }
                                             res
                                         }
-                                        .instrument(span.clone()),
+                                        .instrument(span),
                                     )
                                         as Pin<Box<dyn Future<Output = _> + Send + 'static>>
                                 })));
@@ -676,7 +691,8 @@ where
     }
 }
 
-struct Instance<H, C>
+/// Instantiated component
+pub struct Instance<H, C>
 where
     H: Handler,
 {
@@ -685,6 +701,7 @@ where
     handler: H,
     max_execution_time: Duration,
     events: mpsc::Sender<WrpcServeEvent<C>>,
+    experimental_features: Features,
 }
 
 impl<H, C> Clone for Instance<H, C>
@@ -698,13 +715,14 @@ where
             handler: self.handler.clone(),
             max_execution_time: self.max_execution_time,
             events: self.events.clone(),
+            experimental_features: self.experimental_features,
         }
     }
 }
 
 type TableResult<T> = Result<T, ResourceTableError>;
 
-struct Ctx<H>
+pub(crate) struct Ctx<H>
 where
     H: Handler,
 {
@@ -714,6 +732,7 @@ where
     table: ResourceTable,
     shared_resources: SharedResourceTable,
     timeout: Duration,
+    parent_context: Option<opentelemetry::Context>,
 }
 
 impl<H: Handler> WasiView for Ctx<H> {
@@ -745,5 +764,13 @@ impl<H: Handler> WrpcView for Ctx<H> {
 impl<H: Handler> Debug for Ctx<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ctx").field("runtime", &"wasmtime").finish()
+    }
+}
+
+impl<H: Handler> Ctx<H> {
+    fn attach_parent_context(&self) {
+        if let Some(context) = self.parent_context.as_ref() {
+            Span::current().set_parent(context.clone());
+        }
     }
 }

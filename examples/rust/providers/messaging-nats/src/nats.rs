@@ -25,7 +25,7 @@ use bindings::wasmcloud::messaging::types::BrokerMessage;
 /// [`NatsClientBundle`]s hold a NATS client and information (subscriptions)
 /// related to it.
 ///
-/// This struct is necssary because subscriptions are *not* automatically removed on client drop,
+/// This struct is necessary because subscriptions are *not* automatically removed on client drop,
 /// meaning that we must keep track of all subscriptions to close once the client is done
 #[derive(Debug)]
 struct NatsClientBundle {
@@ -62,7 +62,10 @@ impl NatsMessagingProvider {
             .context("failed to run provider")?;
         let connection = get_connection();
         serve_provider_exports(
-            &connection.get_wrpc_client(connection.provider_key()),
+            &connection
+                .get_wrpc_client(connection.provider_key())
+                .await
+                .context("failed to get wrpc client")?,
             provider,
             shutdown,
             bindings::serve,
@@ -134,7 +137,7 @@ impl NatsMessagingProvider {
         let join_handle = tokio::spawn(async move {
             // Listen for NATS message(s)
             while let Some(msg) = subscriber.next().await {
-                debug!(?msg, ?component_id, "received messsage");
+                debug!(?msg, ?component_id, "received message");
 
                 let component_id = Arc::clone(&component_id);
                 // Dispatch message to component in a green thread / background task to avoid blocking

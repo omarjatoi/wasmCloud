@@ -15,11 +15,15 @@ mod bindings {
             "wasi:keyvalue/atomics@0.2.0-draft": generate,
             "wasi:keyvalue/batch@0.2.0-draft": generate,
             "wasi:keyvalue/store@0.2.0-draft": generate,
+            "wasi:keyvalue/watcher@0.2.0-draft": generate,
             "wasi:logging/logging@0.1.0-draft": generate,
             "wasi:random/random@0.2.2": ::wasi::random::random,
             "wasmcloud:bus/lattice@2.0.0": generate,
             "wasmcloud:messaging/consumer@0.2.0": generate,
+            "wasmcloud:messaging/producer@0.3.0": generate,
+            "wasmcloud:messaging/request-reply@0.3.0": generate,
             "wasmcloud:messaging/types@0.2.0": generate,
+            "wasmcloud:messaging/types@0.3.0": generate,
         }
     });
 }
@@ -29,7 +33,10 @@ pub mod wasi {
     pub use ::wasi::*;
 }
 
-pub use bindings::wasmcloud;
+pub mod wasmcloud {
+    pub use super::bindings::wasmcloud::messaging0_2_0 as messaging;
+    pub use super::bindings::wasmcloud::*;
+}
 
 mod wrappers;
 pub use wrappers::*;

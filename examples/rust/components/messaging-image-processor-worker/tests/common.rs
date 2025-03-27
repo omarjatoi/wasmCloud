@@ -21,7 +21,7 @@ const DEFAULT_POSTGRES_USER: &str = "postgres";
 const DEFAULT_POSTGRES_PASSWORD: &str = "postgres";
 const DEFAULT_POSTGRES_DATABASE: &str = "postgres";
 
-const DEFAULT_APPLICATION_BASE_URL: &str = "http://localhost:8080";
+const DEFAULT_APPLICATION_BASE_URL: &str = "http://localhost:8000";
 
 /// Name of the subscription that will be linked to the component  (see fixtures/test.wadm.yaml)
 pub const TEST_SUBSCRIPTION_NAME: &str = "wasmcloud.test";
@@ -61,7 +61,7 @@ pub struct TestEnv {
 ///
 /// - wasmCloud instance (launched with the component running)
 ///
-/// NOTE: this setup is *NOT* robust (unlike test utilities in wash-cli) -- it expects only one wasmcloud instance
+/// NOTE: this setup is *NOT* robust (unlike test utilities in wash) -- it expects only one wasmcloud instance
 /// to be running at a time.
 pub async fn setup_test_env() -> Result<TestEnv> {
     let pg_tag = std::env::var("TEST_POSTGRES_IMAGE_TAG")
@@ -199,7 +199,7 @@ pub async fn setup_test_env() -> Result<TestEnv> {
         .context("failed to run wash app deploy")?;
     assert!(output.status.success(), "wash app deploy succeeded");
 
-    // Wait until the application is accessible, this can take a whlie for multiple reasons:
+    // Wait until the application is accessible, this can take a while for multiple reasons:
     // - sqldb provider download and start
     // - http server provider setup
     tokio::time::timeout(Duration::from_secs(20), async move {
