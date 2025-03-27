@@ -191,7 +191,7 @@ pub struct WasmcloudOpts {
     pub rpc_timeout_ms: Option<u64>,
 
     /// Timeout duration for all RPC calls
-    #[clap(long = "rpc-timeout", default_value = DEFAULT_RPC_TIMEOUT_MS, env = WASMCLOUD_RPC_TIMEOUT, value_parser = parse_duration_fallback_ms)]
+    #[clap(long = "rpc-timeout", default_value = DEFAULT_RPC_TIMEOUT, env = WASMCLOUD_RPC_TIMEOUT, value_parser = parse_duration_fallback_ms)]
     pub rpc_timeout: Option<Duration>,
 
     /// A user JWT to use to authenticate to NATS for RPC messages
@@ -259,7 +259,7 @@ pub struct WasmcloudOpts {
     pub provider_delay_ms: u32,
 
     /// Delay duration between requesting a provider shut down and forcibly terminating its process
-    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY_MS, env = WASMCLOUD_PROV_SHUTDOWN_DELAY, value_parser = parse_duration_fallback_ms)]
+    #[clap(long = "provider-delay", default_value = DEFAULT_PROV_SHUTDOWN_DELAY, env = WASMCLOUD_PROV_SHUTDOWN_DELAY, value_parser = parse_duration_fallback_ms)]
     pub provider_delay: Duration,
 
     /// Determines whether OCI images tagged latest are allowed to be pulled from OCI registries and started
